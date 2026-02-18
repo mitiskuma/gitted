@@ -96,6 +96,7 @@ export function ClaudeOAuthInput({
 
   const handlePaste = useCallback(
     (e: React.ClipboardEvent) => {
+      e.preventDefault();
       const pasted = e.clipboardData.getData('text').trim();
       if (pasted) {
         onChange(pasted);

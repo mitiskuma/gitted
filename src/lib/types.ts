@@ -68,6 +68,12 @@ export enum StoryPhase {
   EXTRACTING_MILESTONES = 'extracting-milestones',
   COMPLETE = 'complete',
   ERROR = 'error',
+  /** Narrative pipeline v2 phases */
+  PREPROCESSING = 'preprocessing',
+  ANALYZING_REPOS = 'analyzing-repos',
+  CORRELATING = 'correlating',
+  WRITING_CHAPTERS = 'writing-chapters',
+  ENRICHING = 'enriching',
 }
 
 /** Sort options for repository listing */
@@ -1437,6 +1443,10 @@ export interface GitDataState {
   isDataReady: boolean;
   /** Last data refresh timestamp */
   lastRefreshed: number | null;
+  /** Total number of repos being fetched in current batch */
+  totalReposToFetch: number;
+  /** Number of repos that have completed fetching */
+  reposCompletedCount: number;
 }
 
 /** Fetch status for a single repository's data */
