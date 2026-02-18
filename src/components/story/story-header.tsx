@@ -69,6 +69,16 @@ function getStatusConfig(phase: StoryPhase, isGenerating: boolean, error: string
 
 function getPhaseLabel(phase: StoryPhase): string {
   switch (phase) {
+    case 'preprocessing':
+      return 'Analyzing Commits';
+    case 'analyzing-repos':
+      return 'Analyzing Repositories';
+    case 'correlating':
+      return 'Finding Connections';
+    case 'writing-chapters':
+      return 'Writing Chapters';
+    case 'enriching':
+      return 'Finishing Touches';
     case 'batching-commits':
       return 'Preparing Commits';
     case 'summarizing':

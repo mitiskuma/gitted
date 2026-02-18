@@ -18,27 +18,24 @@ import type {
 // ENCRYPTION UTILITIES
 // =============================================================================
 
-const ENCRYPTION_KEY = "gitted-auth-v1";
+const LEGACY_KEY = "gitted-auth-v1";
 
 function encrypt(value: string): string {
   try {
-    const encoded = btoa(
-      encodeURIComponent(value)
-        .split("")
-        .map((c, i) =>
-          String.fromCharCode(
-            c.charCodeAt(0) ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length)
-          )
-        )
-        .join("")
-    );
-    return encoded;
+    return btoa(encodeURIComponent(value));
   } catch {
-    return btoa(value);
+    return value;
   }
 }
 
 function decrypt(value: string): string {
+  // Try new format first (plain base64 of URI-encoded string)
+  try {
+    return decodeURIComponent(atob(value));
+  } catch {
+    // noop — fall through to legacy
+  }
+  // Legacy XOR format for already-stored tokens
   try {
     const decoded = atob(value);
     return decodeURIComponent(
@@ -46,7 +43,7 @@ function decrypt(value: string): string {
         .split("")
         .map((c, i) =>
           String.fromCharCode(
-            c.charCodeAt(0) ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length)
+            c.charCodeAt(0) ^ LEGACY_KEY.charCodeAt(i % LEGACY_KEY.length)
           )
         )
         .join("")
@@ -58,6 +55,22 @@ function decrypt(value: string): string {
       return "";
     }
   }
+}
+
+/**
+ * Fix tokens that were accidentally doubled (pasted twice)
+ * or contain leading/trailing whitespace.
+ */
+function sanitizeToken(token: string): string {
+  let t = token.trim();
+  // Detect doubled token: even length, both halves identical
+  if (t.length > 50 && t.length % 2 === 0) {
+    const half = t.length / 2;
+    if (t.slice(0, half) === t.slice(half)) {
+      t = t.slice(0, half);
+    }
+  }
+  return t;
 }
 
 // =============================================================================
@@ -239,7 +252,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
     if (isInitialized.current) return;
     isInitialized.current = true;
 
-    const claudeToken = getStoredToken(STORAGE_KEYS.CLAUDE_TOKEN);
+    const rawClaudeToken = getStoredToken(STORAGE_KEYS.CLAUDE_TOKEN);
+    // Fix doubled or whitespace-padded tokens from storage
+    const claudeToken = rawClaudeToken ? sanitizeToken(rawClaudeToken) : null;
+    // Re-save if sanitization changed the value
+    if (claudeToken && rawClaudeToken && claudeToken !== rawClaudeToken) {
+      setStoredToken(STORAGE_KEYS.CLAUDE_TOKEN, claudeToken);
+    }
+
     const githubTokenFromStorage = getStoredToken(STORAGE_KEYS.GITHUB_TOKEN);
     const githubTokenFromCookie = getGitHubTokenFromCookie();
     const githubToken = githubTokenFromCookie || githubTokenFromStorage;
@@ -350,7 +370,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return false;
     }
 
-    const trimmedToken = token.trim();
+    const trimmedToken = sanitizeToken(token);
 
     // Validate the token by making a lightweight request
     try {

@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAppStore } from '@/stores/app-store';
-import { useStoryGenerator } from '@/hooks/use-story-generator';
+import { useGitData } from '@/context/git-data-provider';
+import { useNarrativeGenerator } from '@/hooks/use-narrative-generator';
 import { StoryHeader } from '@/components/story/story-header';
 import { UnifiedDeveloperJourney } from '@/components/story/unified-developer-journey';
 import { PerRepoStoryCards } from '@/components/story/per-repo-story-cards';
@@ -30,20 +31,23 @@ import type { StoryMilestone } from '@/lib/types';
 
 const PHASE_LABELS: Record<string, string> = {
   idle: 'Ready to generate',
-  'batching-commits': 'Preparing commit data',
-  summarizing: 'Analyzing patterns',
-  'generating-narrative': 'Crafting your narrative',
-  'extracting-milestones': 'Finding key milestones',
+  preprocessing: 'Analyzing commit intelligence',
+  'analyzing-repos': 'Deep-diving into repositories',
+  correlating: 'Finding cross-repo connections',
+  streaming: 'Connecting to Claude',
+  'writing-chapters': 'Crafting your narrative',
+  enriching: 'Adding finishing touches',
   complete: 'Story complete',
   error: 'Generation failed',
 };
 
 const PHASE_ICONS: Record<string, React.ReactNode> = {
   idle: <BookOpen className="h-5 w-5" />,
-  'batching-commits': <GitCommit className="h-5 w-5 animate-pulse" />,
-  summarizing: <Zap className="h-5 w-5 animate-pulse" />,
-  'generating-narrative': <Sparkles className="h-5 w-5 animate-pulse" />,
-  'extracting-milestones': <Clock className="h-5 w-5 animate-pulse" />,
+  preprocessing: <GitCommit className="h-5 w-5 animate-pulse" />,
+  'analyzing-repos': <Zap className="h-5 w-5 animate-pulse" />,
+  correlating: <Zap className="h-5 w-5 animate-pulse" />,
+  'writing-chapters': <Sparkles className="h-5 w-5 animate-pulse" />,
+  enriching: <Clock className="h-5 w-5 animate-pulse" />,
   complete: <Sparkles className="h-5 w-5" />,
   error: <AlertCircle className="h-5 w-5" />,
 };
@@ -51,15 +55,18 @@ const PHASE_ICONS: Record<string, React.ReactNode> = {
 export default function StoryPage() {
   const router = useRouter();
   const { selectedRepos } = useAppStore();
+  const { selectedRepositories } = useGitData();
   const {
     stories,
     unifiedStory,
+    partialStory,
     isGenerating,
     progress,
+    narrativeProgress,
     generateStory,
     regenerate,
     error,
-  } = useStoryGenerator();
+  } = useNarrativeGenerator();
 
   const [activeSection, setActiveSection] = useState<string>('unified-journey');
   const [shareOpen, setShareOpen] = useState(false);
@@ -124,11 +131,46 @@ export default function StoryPage() {
     }
   }, []);
 
+  // Build a display story from partialStory during streaming, or unifiedStory when complete
+  const streamingDisplayStory = React.useMemo(() => {
+    if (unifiedStory) return null; // Complete story takes precedence
+    if (!partialStory || !partialStory.chapters?.length) return null;
+
+    // Build a minimal GeneratedStory from the partial data
+    const chapters = (partialStory.chapters || []).map((ch) => ({
+      index: ch.index,
+      title: ch.title,
+      content: ch.content,
+      dateRange: ch.dateRange as { start: string; end: string; totalDays: number },
+      repoIds: ch.repoIds,
+      anchorId: ch.anchorId,
+    }));
+
+    const content = chapters
+      .map((ch) => `## ${ch.title}\n\n${ch.content}`)
+      .join('\n\n');
+
+    return {
+      id: partialStory.id || 'streaming',
+      type: 'unified' as const,
+      repoId: null,
+      title: partialStory.title || 'Your Developer Journey',
+      subtitle: partialStory.subtitle || 'Writing your story...',
+      content,
+      chapters,
+      milestones: [],
+      generatedAt: Date.now(),
+      dateRange: partialStory.dateRange as { start: string; end: string; totalDays: number } || { start: '', end: '', totalDays: 0 },
+      model: partialStory.model || '',
+    };
+  }, [unifiedStory, partialStory]);
+
   // Gather all chapters and milestones
+  const effectiveStory = unifiedStory || streamingDisplayStory;
   const allChapters: Array<{ id: string; title: string; type: 'unified' | 'repo'; repoId?: string }> = [];
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const unifiedStoryAny = unifiedStory as any;
+  const unifiedStoryAny = (effectiveStory) as any;
 
   if (unifiedStoryAny) {
     allChapters.push({
@@ -185,7 +227,7 @@ export default function StoryPage() {
   });
 
   const isComplete = progress.phase === 'complete';
-  const hasContent = stories.length > 0 || unifiedStory !== null;
+  const hasContent = stories.length > 0 || unifiedStory !== null || streamingDisplayStory !== null;
 
   // Generate status for header
   const generationStatus: 'idle' | 'generating' | 'complete' | 'error' =
@@ -246,8 +288,8 @@ export default function StoryPage() {
             />
           </div>
 
-          {/* Generation Loading State */}
-          {isGenerating && (
+          {/* Generation Loading State — hide once streaming content is visible */}
+          {isGenerating && !streamingDisplayStory && (
             <Card className="mb-8 border-purple-500/20 bg-gradient-to-br from-purple-950/20 to-background">
               <CardContent className="p-6">
                 <div className="space-y-4">
@@ -271,43 +313,25 @@ export default function StoryPage() {
                   <Progress value={progress.overallProgress} className="h-2" />
 
                   <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
-                    {progress.totalRepos > 0 && (
+                    {narrativeProgress.totalRepos > 0 && (
                       <span className="flex items-center gap-1">
                         <BookOpen className="h-3 w-3" />
-                        {progress.reposProcessed}/{progress.totalRepos} repos
+                        {narrativeProgress.reposAnalyzed}/{narrativeProgress.totalRepos} repos analyzed
+                      </span>
+                    )}
+                    {narrativeProgress.totalChapters > 0 && (
+                      <span className="flex items-center gap-1">
+                        <Sparkles className="h-3 w-3" />
+                        {narrativeProgress.chaptersCompleted}/{narrativeProgress.totalChapters} chapters written
                       </span>
                     )}
                     {progress.totalCommits > 0 && (
                       <span className="flex items-center gap-1">
                         <GitCommit className="h-3 w-3" />
-                        {progress.commitsSummarized.toLocaleString()}/{progress.totalCommits.toLocaleString()} commits
-                      </span>
-                    )}
-                    {progress.estimatedTimeRemaining !== null && progress.estimatedTimeRemaining > 0 && (
-                      <span className="flex items-center gap-1">
-                        <Clock className="h-3 w-3" />
-                        ~{Math.ceil(progress.estimatedTimeRemaining)}s remaining
+                        {progress.totalCommits.toLocaleString()} commits
                       </span>
                     )}
                   </div>
-
-                  {/* Streaming story preview */}
-                  {stories.length > 0 && (
-                    <div className="mt-4 rounded-lg border border-border/50 bg-background/50 p-4">
-                      <p className="mb-2 text-xs font-medium text-muted-foreground">
-                        Stories generated so far:
-                      </p>
-                      <div className="flex flex-wrap gap-2">
-                        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
-                        {stories.map((story: any) => (
-                          <Badge key={story.id as string} variant="outline" className="text-xs">
-                            <Sparkles className="mr-1 h-3 w-3 text-purple-400" />
-                            {story.title as string}
-                          </Badge>
-                        ))}
-                      </div>
-                    </div>
-                  )}
                 </div>
               </CardContent>
             </Card>
@@ -339,8 +363,8 @@ export default function StoryPage() {
 
           {/* Content Area */}
           <div ref={contentRef} className="space-y-12">
-            {/* Unified Developer Journey */}
-            {unifiedStory && (
+            {/* Unified Developer Journey (or streaming preview) */}
+            {effectiveStory && (
               <section
                 id="unified-journey"
                 ref={(el) => {
@@ -350,9 +374,18 @@ export default function StoryPage() {
                 }}
               >
                 <UnifiedDeveloperJourney
-                  story={unifiedStory}
+                  story={effectiveStory}
                   onChapterVisible={(chapterId) => setActiveSection(chapterId)}
                 />
+                {/* Show streaming indicator when chapters are still arriving */}
+                {isGenerating && streamingDisplayStory && (
+                  <div className="mt-4 flex items-center gap-3 rounded-lg border border-purple-500/20 bg-purple-500/5 p-4">
+                    <Loader2 className="h-4 w-4 animate-spin text-purple-400" />
+                    <span className="text-sm text-muted-foreground">
+                      {narrativeProgress.currentStep}
+                    </span>
+                  </div>
+                )}
               </section>
             )}
 
@@ -394,7 +427,7 @@ export default function StoryPage() {
                 </div>
                 <MilestoneTimeline
                   milestones={uniqueMilestones}
-                  repositories={[]}
+                  repositories={selectedRepositories}
                 />
               </section>
             )}
