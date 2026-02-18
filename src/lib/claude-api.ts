@@ -43,7 +43,6 @@ export class ClaudeApiError extends Error {
 // CONSTANTS
 // =============================================================================
 
-const CLAUDE_API_BASE = 'https://api.anthropic.com/v1';
 const CLAUDE_MODEL = 'claude-opus-4-6';
 const MAX_INPUT_TOKENS_SAFETY = 180000; // Leave headroom below the 200k context
 const MAX_OUTPUT_TOKENS = 4096;
@@ -51,25 +50,118 @@ const BATCH_SIZE_COMMITS = 100;
 const MAX_SUMMARY_CHARS_PER_BATCH = 2000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_BASE_MS = 1000;
+const API_TIMEOUT_MS = 300_000; // 5 minutes — matches OpenDev
 
 // =============================================================================
-// AUTH HELPERS
+// NATIVE HTTP — bypass Next.js fetch patching which breaks OAuth tokens
 // =============================================================================
+
+// Next.js globally patches `fetch` (and even undici) with caching/revalidation
+// logic that corrupts Authorization headers for OAuth bearer tokens.
+// We use Node's built-in https module to make Anthropic API calls directly.
+import https from 'https';
+
+function httpsRequest(
+  url: string,
+  options: { method: string; headers: Record<string, string>; body: string; timeout: number }
+): Promise<{ status: number; headers: Record<string, string>; body: string }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const req = https.request(
+      {
+        hostname: parsed.hostname,
+        path: parsed.pathname,
+        method: options.method,
+        headers: {
+          ...options.headers,
+          'content-length': Buffer.byteLength(options.body).toString(),
+        },
+        timeout: options.timeout,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          const responseHeaders: Record<string, string> = {};
+          for (const [key, val] of Object.entries(res.headers)) {
+            if (typeof val === 'string') responseHeaders[key] = val;
+          }
+          resolve({
+            status: res.statusCode || 500,
+            headers: responseHeaders,
+            body: Buffer.concat(chunks).toString('utf-8'),
+          });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timed out'));
+    });
+    req.write(options.body);
+    req.end();
+  });
+}
 
 /**
- * Build auth headers based on token type.
- * OAuth tokens (sk-ant-oat*) use Bearer auth + beta flags.
- * Regular API keys (sk-ant-api*) use x-api-key header.
+ * Streaming HTTPS request that returns a readable stream.
  */
-function buildAuthHeaders(token: string): Record<string, string> {
-  const isOAuthToken = token.startsWith('sk-ant-oat');
-  if (isOAuthToken) {
-    return {
-      Authorization: `Bearer ${token}`,
-      'anthropic-beta': 'oauth-2025-04-20',
-    };
-  }
-  return { 'x-api-key': token };
+function httpsRequestStream(
+  url: string,
+  options: { method: string; headers: Record<string, string>; body: string; timeout: number }
+): Promise<{ status: number; headers: Record<string, string>; stream: NodeJS.ReadableStream }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const req = https.request(
+      {
+        hostname: parsed.hostname,
+        path: parsed.pathname,
+        method: options.method,
+        headers: {
+          ...options.headers,
+          'content-length': Buffer.byteLength(options.body).toString(),
+        },
+        timeout: options.timeout,
+      },
+      (res) => {
+        const responseHeaders: Record<string, string> = {};
+        for (const [key, val] of Object.entries(res.headers)) {
+          if (typeof val === 'string') responseHeaders[key] = val;
+        }
+
+        // For error responses, read the full body
+        if (res.statusCode && res.statusCode >= 400) {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => {
+            resolve({
+              status: res.statusCode || 500,
+              headers: responseHeaders,
+              stream: res,
+            });
+            // Attach the body for error reading
+            (res as NodeJS.ReadableStream & { _errorBody?: string })._errorBody =
+              Buffer.concat(chunks).toString('utf-8');
+          });
+          return;
+        }
+
+        resolve({
+          status: res.statusCode || 200,
+          headers: responseHeaders,
+          stream: res,
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timed out'));
+    });
+    req.write(options.body);
+    req.end();
+  });
 }
 
 // =============================================================================
@@ -91,6 +183,10 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Call Claude Messages API — mirrors OpenDev's AnthropicProvider.chatOnce exactly.
+ * OAuth tokens (sk-ant-oat*) use Bearer + beta flag; API keys use x-api-key.
+ */
 async function callClaudeApi(
   token: string,
   request: ClaudeApiRequest
@@ -99,43 +195,46 @@ async function callClaudeApi(
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const response = await fetch(`${CLAUDE_API_BASE}/messages`, {
+      // Build body exactly like OpenDev: conditionally add system & temperature
+      const body: Record<string, unknown> = {
+        model: request.model,
+        max_tokens: request.maxTokens,
+        messages: [{ role: 'user', content: request.userMessage }],
+      };
+      if (request.systemPrompt) body.system = request.systemPrompt;
+      if (request.temperature !== undefined) body.temperature = request.temperature;
+
+      // Auth + headers match OpenDev's AnthropicProvider.chatOnce
+      const isOAuth = token.startsWith('sk-ant-oat');
+      const authHeaders: Record<string, string> = isOAuth
+        ? {
+            Authorization: `Bearer ${token}`,
+            'anthropic-beta': 'oauth-2025-04-20',
+          }
+        : { 'x-api-key': token };
+
+      const jsonBody = JSON.stringify(body);
+      const reqHeaders = {
+        ...authHeaders,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      };
+
+      const response = await httpsRequest('https://api.anthropic.com/v1/messages', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...buildAuthHeaders(token),
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: request.model,
-          max_tokens: request.maxTokens,
-          system: request.systemPrompt,
-          messages: [
-            {
-              role: 'user',
-              content: request.userMessage,
-            },
-          ],
-          temperature: request.temperature,
-          stream: false,
-        }),
+        headers: reqHeaders,
+        body: jsonBody,
+        timeout: API_TIMEOUT_MS,
       });
 
-      if (!response.ok) {
-        const errorBody = await response.text().catch(() => 'Unknown error');
-        let errorJson: Record<string, unknown> = {};
-        try {
-          errorJson = JSON.parse(errorBody);
-        } catch {
-          // not JSON
-        }
-
-        const retryAfterHeader = response.headers.get('retry-after');
-        const retryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) : null;
+      if (response.status >= 400) {
+        const retryAfter = response.headers['retry-after']
+          ? parseInt(response.headers['retry-after'], 10)
+          : null;
 
         if (response.status === 429) {
           throw new ClaudeApiError(
-            `Rate limited by Claude API: ${errorJson?.error?.toString() || errorBody}`,
+            `Rate limited by Claude API: ${response.body}`,
             'RATE_LIMITED',
             429,
             retryAfter || 30,
@@ -155,7 +254,7 @@ async function callClaudeApi(
 
         if (response.status === 401) {
           throw new ClaudeApiError(
-            'Invalid or expired Claude API token.',
+            `Invalid or expired Claude API token. Detail: ${response.body}`,
             'UNAUTHORIZED',
             401,
             null,
@@ -164,7 +263,7 @@ async function callClaudeApi(
         }
 
         throw new ClaudeApiError(
-          `Claude API error (${response.status}): ${errorJson?.error?.toString() || errorBody}`,
+          `Claude API error (${response.status}): ${response.body}`,
           'API_ERROR',
           response.status,
           null,
@@ -172,13 +271,8 @@ async function callClaudeApi(
         );
       }
 
-      const data = await response.json();
-
-      const content =
-        data.content
-          ?.filter((block: { type: string }) => block.type === 'text')
-          .map((block: { text: string }) => block.text)
-          .join('') || '';
+      const data = JSON.parse(response.body);
+      const content = data.content?.[0]?.text ?? '';
 
       return {
         content,
@@ -220,36 +314,54 @@ async function callClaudeApiStreaming(
   request: ClaudeApiRequest,
   onChunk: (chunk: ClaudeStreamChunk) => void
 ): Promise<string> {
-  const response = await fetch(`${CLAUDE_API_BASE}/messages`, {
+  // Build body matching OpenDev pattern + stream flag
+  const body: Record<string, unknown> = {
+    model: request.model,
+    max_tokens: request.maxTokens,
+    messages: [{ role: 'user', content: request.userMessage }],
+    stream: true,
+  };
+  if (request.systemPrompt) body.system = request.systemPrompt;
+  if (request.temperature !== undefined) body.temperature = request.temperature;
+
+  const isOAuth = token.startsWith('sk-ant-oat');
+  const authHeaders: Record<string, string> = isOAuth
+    ? {
+        Authorization: `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+      }
+    : { 'x-api-key': token };
+
+  const jsonBody = JSON.stringify(body);
+  const streamResponse = await httpsRequestStream('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      ...buildAuthHeaders(token),
+      ...authHeaders,
       'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
     },
-    body: JSON.stringify({
-      model: request.model,
-      max_tokens: request.maxTokens,
-      system: request.systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: request.userMessage,
-        },
-      ],
-      temperature: request.temperature,
-      stream: true,
-    }),
+    body: jsonBody,
+    timeout: API_TIMEOUT_MS,
   });
 
-  if (!response.ok) {
-    const errorBody = await response.text().catch(() => 'Unknown error');
-    const retryAfterHeader = response.headers.get('retry-after');
-    const retryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) : null;
+  if (streamResponse.status >= 400) {
+    // Read error body from stream
+    const errorBody = await new Promise<string>((resolve) => {
+      const chunks: Buffer[] = [];
+      streamResponse.stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+      streamResponse.stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      // If already consumed (by httpsRequestStream error path), use _errorBody
+      const cached = (streamResponse.stream as NodeJS.ReadableStream & { _errorBody?: string })._errorBody;
+      if (cached) resolve(cached);
+    });
 
-    if (response.status === 429) {
+    const retryAfter = streamResponse.headers['retry-after']
+      ? parseInt(streamResponse.headers['retry-after'], 10)
+      : null;
+
+    if (streamResponse.status === 429) {
       throw new ClaudeApiError(
-        'Rate limited by Claude API',
+        `Rate limited by Claude API: ${errorBody}`,
         'RATE_LIMITED',
         429,
         retryAfter || 30,
@@ -257,9 +369,9 @@ async function callClaudeApiStreaming(
       );
     }
 
-    if (response.status === 401) {
+    if (streamResponse.status === 401) {
       throw new ClaudeApiError(
-        'Invalid or expired Claude API token.',
+        `Invalid or expired Claude API token. Detail: ${errorBody}`,
         'UNAUTHORIZED',
         401,
         null,
@@ -268,29 +380,20 @@ async function callClaudeApiStreaming(
     }
 
     throw new ClaudeApiError(
-      `Claude API streaming error (${response.status}): ${errorBody}`,
+      `Claude API streaming error (${streamResponse.status}): ${errorBody}`,
       'API_ERROR',
-      response.status,
+      streamResponse.status,
       null,
-      response.status >= 500
+      streamResponse.status >= 500
     );
   }
 
-  const reader = response.body?.getReader();
-  if (!reader) {
-    throw new ClaudeApiError('No response body for streaming', 'NO_BODY', 500, null, false);
-  }
-
-  const decoder = new TextDecoder();
   let fullContent = '';
   let buffer = '';
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
+  return new Promise<string>((resolve, reject) => {
+    streamResponse.stream.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf-8');
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
@@ -324,12 +427,11 @@ async function callClaudeApiStreaming(
           }
         }
       }
-    }
-  } finally {
-    reader.releaseLock();
-  }
+    });
 
-  return fullContent;
+    streamResponse.stream.on('end', () => resolve(fullContent));
+    streamResponse.stream.on('error', (err: Error) => reject(err));
+  });
 }
 
 // =============================================================================
@@ -1260,4 +1362,4 @@ export async function validateClaudeToken(token: string): Promise<boolean> {
   }
 }
 
-export { batchCommits, formatBatchesForPrompt, estimateTokens, summarizeCommitBatch };
+export { callClaudeApi, callClaudeApiStreaming, batchCommits, formatBatchesForPrompt, estimateTokens, summarizeCommitBatch };

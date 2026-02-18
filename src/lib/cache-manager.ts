@@ -15,7 +15,7 @@ const CACHE_CONFIG: CacheConfig = {
 
 // TTL presets following Rule 11
 export const CACHE_TTL = {
-  COMMITS: 3600000,        // 1 hour
+  COMMITS: 86400000,       // 24 hours (incremental fetching corrects stale data)
   ANALYTICS: 86400000,     // 24 hours
   STORIES: 86400000,       // 24 hours
   REPOS: 3600000,          // 1 hour

@@ -632,7 +632,7 @@ export async function fetchAllRepoCommits(
     // Large repo: fetch in parallel batches of 5 pages
     const BATCH_SIZE = 5;
     let currentPage = 2;
-    const maxPage = Math.min(totalPages, 100); // Cap at 10,000 commits
+    const maxPage = Math.min(totalPages, 300); // Cap at 30,000 commits
 
     while (currentPage <= maxPage) {
       const batchEnd = Math.min(currentPage + BATCH_SIZE - 1, maxPage);
@@ -689,7 +689,7 @@ export async function fetchAllRepoCommits(
       }
 
       // Safety cap
-      if (page > 100) break;
+      if (page > 300) break;
     }
   }
 

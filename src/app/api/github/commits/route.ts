@@ -4,6 +4,7 @@ import { cookies } from 'next/headers';
 import {
   fetchRepoCommits,
   fetchAllRepoCommits,
+  getRateLimit,
 } from '@/lib/github-api';
 import { GitHubApiError } from '@/lib/github-api';
 import type {
@@ -89,6 +90,17 @@ function chunk<T>(array: T[], size: number): T[][] {
     chunks.push(array.slice(i, i + size));
   }
   return chunks;
+}
+
+/**
+ * Determine chunk size based on current rate limit remaining.
+ * Reduces parallelism as rate limit budget shrinks.
+ */
+function getAdaptiveChunkSize(): number {
+  const rateLimit = getRateLimit();
+  if (rateLimit.remaining < 50) return 1;
+  if (rateLimit.remaining < 200) return 2;
+  return 5;
 }
 
 /**
@@ -330,16 +342,17 @@ export async function GET(request: NextRequest): Promise<NextResponse<ApiRespons
       const result = await fetchSingleRepoCommits(token, owner, repo, fetchOptions);
       results = [result];
     } else {
-      // Multiple repos: parallel batching in chunks of 3 to avoid rate limits
+      // Multiple repos: parallel batching with adaptive chunk sizing.
       // GitHub rate limit is 5000 req/hour for authenticated users.
-      // Each "fetchAll" can consume 10-100+ requests depending on repo size.
-      // Chunks of 3 keep concurrency reasonable.
-      const PARALLEL_CHUNK_SIZE = 3;
-      const repoChunks = chunk(parsedRepos, PARALLEL_CHUNK_SIZE);
-
+      // Chunk size adapts: 5 (normal), 2 (low budget), 1 (critical).
       results = [];
 
-      for (const repoChunk of repoChunks) {
+      // Re-evaluate chunk size before each batch to react to rate limit changes
+      const remainingRepos = [...parsedRepos];
+      while (remainingRepos.length > 0) {
+        const chunkSize = getAdaptiveChunkSize();
+        const repoChunk = remainingRepos.splice(0, chunkSize);
+
         const chunkResults = await Promise.all(
           repoChunk.map(({ owner, repo }) =>
             fetchSingleRepoCommits(token, owner, repo, fetchOptions)
@@ -348,8 +361,7 @@ export async function GET(request: NextRequest): Promise<NextResponse<ApiRespons
         results.push(...chunkResults);
 
         // Small delay between chunks to be kind to GitHub's rate limiter
-        // Only needed when fetching all commits across many repos
-        if (fetchAll && repoChunks.length > 1) {
+        if (fetchAll && remainingRepos.length > 0) {
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
       }
@@ -602,11 +614,13 @@ export async function POST(request: NextRequest): Promise<NextResponse<ApiRespon
   // 3. Fetch commits in parallel chunks
   // -------------------------------------------------------------------------
   try {
-    const PARALLEL_CHUNK_SIZE = 3;
-    const repoChunks = chunk(repos, PARALLEL_CHUNK_SIZE);
     const results: RepoCommitResult[] = [];
+    const remainingRepos = [...repos];
 
-    for (const repoChunk of repoChunks) {
+    while (remainingRepos.length > 0) {
+      const chunkSize = getAdaptiveChunkSize();
+      const repoChunk = remainingRepos.splice(0, chunkSize);
+
       const chunkResults = await Promise.all(
         repoChunk.map(({ owner, repo }) =>
           fetchSingleRepoCommits(token, owner, repo, {
@@ -622,7 +636,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<ApiRespon
       results.push(...chunkResults);
 
       // Delay between chunks when doing exhaustive fetches
-      if (fetchAll && repoChunks.length > 1) {
+      if (fetchAll && remainingRepos.length > 0) {
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
     }
