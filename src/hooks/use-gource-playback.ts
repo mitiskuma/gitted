@@ -5,16 +5,7 @@ import type { GourceEngine } from '@/lib/gource-engine';
 import type { UseGourcePlaybackReturn } from '@/lib/types';
 import { PlaybackState, PlaybackSpeed } from '@/lib/types';
 
-function dateToString(timestampMs: number): string {
-  const d = new Date(timestampMs);
-  return d.toISOString().split('T')[0];
-}
-
-/**
- * Hook managing gource animation playback state.
- * Thin wrapper around GourceEngine — delegates all game logic to the engine.
- * Syncs playback state with the zustand app store (gourcePlaybackState).
- */
+/** Hook managing Gource animation playback state, delegating to the GourceEngine. */
 export function useGourcePlayback(): UseGourcePlaybackReturn & {
   engineRef: React.MutableRefObject<GourceEngine | null>;
   setEngine: (engine: GourceEngine) => void;
@@ -87,9 +78,6 @@ export function useGourcePlayback(): UseGourcePlaybackReturn & {
         },
         onDateChange: (date) => {
           setCurrentDate(date);
-        },
-        onFrame: (engineState) => {
-          // Lightweight — we batch UI updates in the sync loop above
         },
       });
 

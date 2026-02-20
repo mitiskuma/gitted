@@ -45,6 +45,7 @@ function getSpeedLabel(speed: PlaybackSpeed): string {
   return option?.label ?? `${speed}×`;
 }
 
+/** Play/pause, speed selector, and fullscreen controls for the Gource visualization. */
 export function PlaybackControls({
   playbackState,
   speed,

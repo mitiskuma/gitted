@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import { cn } from '@/lib/utils';
 import type { TimelineScrubberProps } from '@/lib/types';
 
@@ -9,9 +9,12 @@ interface MilestoneMarker {
   label: string;
 }
 
+/** Interactive timeline scrubber with commit density histogram and milestone markers. */
 export function TimelineScrubber({
   progress,
   onSeek,
+  onSeekStart,
+  onSeekEnd,
   startDate,
   endDate,
   commitDensity,
@@ -58,11 +61,12 @@ export function TimelineScrubber({
       e.preventDefault();
       e.stopPropagation();
       setIsDragging(true);
+      onSeekStart?.();
       const p = getProgressFromEvent(e.clientX);
       onSeek(p);
       (e.target as HTMLElement).setPointerCapture(e.pointerId);
     },
-    [getProgressFromEvent, onSeek],
+    [getProgressFromEvent, onSeek, onSeekStart],
   );
 
   const handlePointerMove = useCallback(
@@ -95,9 +99,10 @@ export function TimelineScrubber({
       if (isDragging) {
         setIsDragging(false);
         (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+        onSeekEnd?.();
       }
     },
-    [isDragging],
+    [isDragging, onSeekEnd],
   );
 
   const handlePointerLeave = useCallback(() => {
