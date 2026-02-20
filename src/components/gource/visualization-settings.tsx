@@ -174,6 +174,7 @@ function SettingsSection({
 
 // ─── Main Component ─────────────────────────────────────────────────────────
 
+/** Slide-out settings panel for configuring rendering, physics, colors, and date filters. */
 export function VisualizationSettings({
   settings,
   onSettingsChange,
@@ -332,6 +333,7 @@ export function VisualizationSettings({
                 variant="outline"
                 size="icon"
                 className="h-9 w-9 border-white/10 bg-black/60 text-zinc-300 backdrop-blur-md hover:border-white/20 hover:bg-black/80 hover:text-white"
+                aria-label="Open visualization settings"
               >
                 <SettingsIcon className="h-4 w-4" />
               </Button>
@@ -678,6 +680,7 @@ export function VisualizationSettings({
                   value={settings.backgroundColor}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleBackgroundChange(e.target.value)}
                   className="h-7 w-7 cursor-pointer rounded border-0 bg-transparent p-0"
+                  aria-label="Pick background color"
                 />
               </div>
             </div>
@@ -747,6 +750,7 @@ export function VisualizationSettings({
                                   )
                                 }
                                 className="h-8 w-8 cursor-pointer rounded border-0 bg-transparent p-0"
+                                aria-label={`Pick ${meta.label} color`}
                               />
                               <Input
                                 value={currentColor}

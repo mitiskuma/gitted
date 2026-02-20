@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="2ff532bd-c745-4b85-a763-6b712ab4220b" name="Changes" comment="v2">
+      <change afterPath="$PROJECT_DIR$/.env.example" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/next.config.ts" beforeDir="false" afterPath="$PROJECT_DIR$/next.config.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/package.json" beforeDir="false" afterPath="$PROJECT_DIR$/package.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/app/gource/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/gource/page.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/app/layout.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/layout.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/components/gource/contributor-legend.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/components/gource/contributor-legend.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/components/gource/gource-viewer.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/components/gource/gource-viewer.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/components/gource/playback-controls.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/components/gource/playback-controls.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/components/gource/repo-selector-tabs.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/components/gource/repo-selector-tabs.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/components/gource/timeline-scrubber.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/components/gource/timeline-scrubber.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/components/gource/visualization-settings.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/components/gource/visualization-settings.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/components/layout/footer.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/components/layout/footer.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/components/layout/navbar.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/components/layout/navbar.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/hooks/use-gource-playback.ts" beforeDir="false" afterPath="$PROJECT_DIR$/src/hooks/use-gource-playback.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/lib/gource-engine.ts" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib/gource-engine.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/lib/gource-layout.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/lib/gource-renderer.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/lib/types.ts" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib/types.ts" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_BRANCH_BY_REPOSITORY">
+      <map>
+        <entry key="$PROJECT_DIR$" value="main" />
+      </map>
+    </option>
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="GithubDefaultAccount">
+    <option name="defaultAccountId" value="66464f98-feb3-4881-874d-f3e1da74d545" />
+  </component>
+  <component name="ProjectColorInfo"><![CDATA[{
+  "associatedIndex": 6
+}]]></component>
+  <component name="ProjectId" id="39pW9rqzuJRCsQi9lxcCMo9SVS9" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
+    "git-widget-placeholder": "improve-gource-rendering",
+    "javascript.preferred.runtime.type.id": "node",
+    "last_opened_file_path": "/Users/arditbiniqi/WebstormProjects/gitted",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "settings.editor.selected.configurable": "preferences.lookFeel",
+    "vue.rearranger.settings.migration": "true"
+  }
+}]]></component>
+  <component name="ReactDesignerToolWindowState">
+    <option name="myId2Visible">
+      <map>
+        <entry key="com.intellij.reactbuddy.reactComponents" value="false" />
+        <entry key="com.intellij.reactbuddy.reactInspector" value="false" />
+        <entry key="com.intellij.reactbuddy.storybook" value="false" />
+      </map>
+    </option>
+  </component>
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$" />
+      <recent name="$PROJECT_DIR$/src/app" />
+    </key>
+  </component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-js-predefined-d6986cc7102b-9b0f141eb926-JavaScript-WS-253.29346.242" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="2ff532bd-c745-4b85-a763-6b712ab4220b" name="Changes" comment="" />
+      <created>1771393344465</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1771393344465</updated>
+      <workItem from="1771393345641" duration="8503000" />
+    </task>
+    <task id="LOCAL-00001" summary="v1">
+      <option name="closed" value="true" />
+      <created>1771394038789</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1771394038789</updated>
+    </task>
+    <task id="LOCAL-00002" summary="v2">
+      <option name="closed" value="true" />
+      <created>1771424320226</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1771424320226</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="v1" />
+    <MESSAGE value="v2" />
+    <option name="LAST_COMMIT_MESSAGE" value="v2" />
+  </component>
+</project>

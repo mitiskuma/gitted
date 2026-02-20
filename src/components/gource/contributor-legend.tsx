@@ -16,6 +16,7 @@ import type { GourceContributor, ContributorLegendProps } from '@/lib/types';
 import { Search, Eye, EyeOff, Users, GitCommitHorizontal, X } from 'lucide-react';
 
 interface ExtendedContributorLegendProps extends ContributorLegendProps {
+  /** Total number of commits across all contributors (reserved for future display). */
   totalCommits?: number;
 }
 
@@ -54,11 +55,11 @@ function hexToRgba(color: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+/** Collapsible sidebar listing contributors with search, filtering, and highlight controls. */
 export function ContributorLegend({
   contributors,
   highlightedId,
   onContributorClick,
-  totalCommits = 0,
 }: ExtendedContributorLegendProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [isCollapsed, setIsCollapsed] = useState(false);
@@ -145,6 +146,7 @@ export function ContributorLegend({
           size="icon"
           className="h-6 w-6 rounded-md text-white/40 hover:bg-white/10 hover:text-white/80"
           onClick={() => setIsCollapsed(true)}
+          aria-label="Collapse contributor panel"
         >
           <X className="h-3.5 w-3.5" />
         </Button>
@@ -159,6 +161,7 @@ export function ContributorLegend({
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search contributors..."
+              aria-label="Search contributors"
               className="h-8 rounded-lg border-white/5 bg-white/5 pl-8 text-xs text-white/90 placeholder:text-white/25 focus-visible:border-blue-500/30 focus-visible:ring-0 focus-visible:ring-offset-0"
             />
             {searchQuery && (
@@ -167,6 +170,7 @@ export function ContributorLegend({
                 size="icon"
                 className="absolute right-1 top-1/2 h-5 w-5 -translate-y-1/2 rounded text-white/30 hover:bg-white/10 hover:text-white/60"
                 onClick={() => setSearchQuery('')}
+                aria-label="Clear search"
               >
                 <X className="h-3 w-3" />
               </Button>
@@ -202,7 +206,7 @@ export function ContributorLegend({
               <p className="text-xs text-white/30">No contributors found</p>
             </div>
           ) : (
-            filteredContributors.map((contributor, index) => {
+            filteredContributors.map((contributor) => {
               const isHighlighted = highlightedId === contributor.id;
               const isSoloed = highlightedId !== null && !isHighlighted;
 

@@ -3,8 +3,6 @@ import type {
   GourceNode,
   GourceCommitEvent,
   GourceContributor,
-  GourceBeam,
-  GourceParticle,
   GourceSettings,
   GourceCamera,
   GourceState,
@@ -12,7 +10,6 @@ import type {
   GameLoopState,
   Repository,
   Contributor,
-  PlaybackState as PlaybackStateEnum,
   FileCategory,
   Bounds,
   Point,
@@ -28,6 +25,10 @@ import {
   PlaybackSpeed,
   FileCategory as FileCategoryEnum,
 } from '@/lib/types';
+
+import { LayoutBuffers, NodeFlags, parseColorToRgb } from '@/lib/layout-buffers';
+import { TreeLayout } from '@/lib/tree-layout';
+import { BeamPool, ParticlePool } from '@/lib/object-pools';
 
 // =============================================================================
 // HELPER UTILITIES
@@ -442,30 +443,53 @@ function generateSyntheticFiles(
 // GOURCE ENGINE
 // =============================================================================
 
+/** Callbacks emitted by the engine during the game loop. */
 export interface GourceEngineCallbacks {
   onFrame?: (state: GourceState) => void;
   onDateChange?: (date: string) => void;
-  onPlaybackChange?: (state: PlaybackStateEnum) => void;
+  onPlaybackChange?: (state: PlaybackState) => void;
   onStatsUpdate?: (stats: { fps: number; nodeCount: number; edgeCount: number; beamCount: number }) => void;
 }
 
+/** Input data required to construct a GourceEngine. */
 export interface GourceEngineData {
   commits: CommitData[];
   repositories: Repository[];
   contributors: Contributor[];
 }
 
+/**
+ * Core visualization engine for gource-style commit history animation.
+ *
+ * Manages a dual-storage scene graph: SoA typed-array buffers (`LayoutBuffers`)
+ * for cache-friendly physics and rendering, plus a `Map<string, GourceNode>`
+ * facade for external consumers (hit testing, tooltips, label rendering).
+ * Positions are synced from buffers to the Map each frame.
+ */
 export class GourceEngine {
   // ---- Data ----
   private commitEvents: GourceCommitEvent[] = [];
   private repositories: Repository[] = [];
   private repoColorMap: Map<string, string> = new Map();
 
-  // ---- Scene Graph ----
+  // ---- Scene Graph (SoA buffers + tree layout) ----
+  private buffers: LayoutBuffers;
+  private treeLayout: TreeLayout;
+
+  /**
+   * Legacy node Map maintained alongside SoA `buffers` for external consumers.
+   * The viewer component reads from this Map for hit testing and tooltip display,
+   * and internal rendering methods (labels, legend overlay, camera auto-follow)
+   * iterate it. Positions are synced from buffers each frame via syncBuffersToNodes().
+   */
   private nodes: Map<string, GourceNode> = new Map();
+
+  // ---- Contributors ----
   private contributors: Map<string, GourceContributor> = new Map();
-  private beams: GourceBeam[] = [];
-  private particles: GourceParticle[] = [];
+
+  // ---- Effects (typed-array pools) ----
+  private beamPool: BeamPool;
+  private particlePool: ParticlePool;
 
   // ---- State ----
   private state: GourceState;
@@ -509,6 +533,14 @@ export class GourceEngine {
   constructor(data: GourceEngineData) {
     this.settings = { ...DEFAULT_GOURCE_SETTINGS };
     this.camera = { ...DEFAULT_CAMERA };
+
+    // Initialize SoA buffers and tree layout
+    this.buffers = new LayoutBuffers(16384);
+    this.treeLayout = new TreeLayout(this.buffers);
+
+    // Initialize object pools
+    this.beamPool = new BeamPool(512);
+    this.particlePool = new ParticlePool(512);
 
     this.loopState = {
       isRunning: false,
@@ -643,6 +675,7 @@ export class GourceEngine {
     });
   }
 
+  /** Bind the engine to a canvas element and create initial scene graph. */
   public initialize(canvas: HTMLCanvasElement): void {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d', { alpha: false });
@@ -657,7 +690,8 @@ export class GourceEngine {
       const baseAngle = repoCount > 1
         ? (i / repoCount) * Math.PI * 2 - Math.PI / 2
         : 0;
-      const baseRadius = repoCount > 1 ? 150 : 0;
+      const baseRadius = repoCount > 1 ? 300 : 0;
+
       const node = this.createNode(repo.fullName, repo.name, null, true, repo.fullName);
       node.x = Math.cos(baseAngle) * baseRadius;
       node.y = Math.sin(baseAngle) * baseRadius;
@@ -666,7 +700,23 @@ export class GourceEngine {
       node.opacity = 1;
       node.scale = 1;
       node.angle = baseAngle;
+
+      // Register in SoA buffers
+      const idx = this.buffers.getIndex(repo.fullName);
+      if (idx > 0) {
+        this.buffers.x[idx] = node.x;
+        this.buffers.y[idx] = node.y;
+        this.buffers.targetX[idx] = node.x;
+        this.buffers.targetY[idx] = node.y;
+        this.buffers.opacity[idx] = 1;
+        this.buffers.scale[idx] = 1;
+        this.buffers.angle[idx] = baseAngle;
+        this.treeLayout.addRoot(idx);
+      }
     }
+
+    // Recompute full tree layout
+    this.treeLayout.recomputeAll();
 
     // Pre-load contributor avatars
     this.contributors.forEach((contributor) => {
@@ -676,6 +726,7 @@ export class GourceEngine {
     });
   }
 
+  /** Resize the canvas and update internal dimensions. */
   public resize(width: number, height: number): void {
     if (!this.canvas || !this.ctx) return;
     this.width = width;
@@ -733,38 +784,56 @@ export class GourceEngine {
     let nodeColor: string;
     if (isDirectory) {
       const repoColor = this.repoColorMap.get(repoId) || '#60a5fa';
-      // Muted/darker version for directories
       const rgb = hexToRgb(repoColor);
       nodeColor = `rgb(${Math.round(rgb.r * 0.5)}, ${Math.round(rgb.g * 0.5)}, ${Math.round(rgb.b * 0.5)})`;
     } else {
-      // Try language color first, then user overrides, then category, then fallback
       nodeColor = this.settings.extensionColors[extension]
         || getLanguageColor(extension)
         || FILE_CATEGORY_COLORS[category]
         || '#94a3b8';
     }
 
-    // Calculate initial position using radial tree layout
+    // Allocate in SoA buffers
+    const idx = this.buffers.allocate(path);
+    const parentIdx = parentId ? this.buffers.getIndex(parentId) : 0;
     const parentNode = parentId ? this.nodes.get(parentId) : null;
     const depth = parentNode ? parentNode.depth + 1 : 0;
 
-    // Spread children around parent using golden angle for better distribution
-    const siblingCount = parentNode ? parentNode.children.length : 0;
-    const goldenAngle = Math.PI * (3 - Math.sqrt(5)); // ~2.399 radians
-    const baseAngle = parentNode ? parentNode.angle : 0;
-    const childAngle = baseAngle + goldenAngle * (siblingCount + 1) + (Math.random() - 0.5) * 0.3;
+    // Set buffer data
+    this.buffers.depth[idx] = depth;
+    this.buffers.setColor(idx, nodeColor);
+    if (isDirectory) {
+      this.buffers.setFlag(idx, NodeFlags.IS_DIR);
+    }
+    this.buffers.setFlag(idx, NodeFlags.VISIBLE);
 
-    // Radius grows with depth but shrinks per child density
-    const branchLength = isDirectory
-      ? 60 + Math.max(0, 30 - depth * 5)
-      : 35 + Math.random() * 20;
+    // Link to parent in buffers
+    if (parentIdx > 0) {
+      this.buffers.addChild(parentIdx, idx);
+    }
 
+    // Compute initial position from tree layout target
+    // (The tree layout sets targets; use parent pos + angle as starting point)
     const baseX = parentNode ? parentNode.x : 0;
     const baseY = parentNode ? parentNode.y : 0;
 
-    const x = baseX + Math.cos(childAngle) * branchLength;
-    const y = baseY + Math.sin(childAngle) * branchLength;
+    // Use a temporary angle until tree layout recomputes
+    const siblingCount = parentNode ? parentNode.children.length : 0;
+    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+    const childAngle = (parentNode ? parentNode.angle : 0) + goldenAngle * (siblingCount + 1);
+    const branchLen = isDirectory ? 60 + Math.max(0, 30 - depth * 5) : 35 + Math.random() * 20;
 
+    const x = baseX + Math.cos(childAngle) * branchLen;
+    const y = baseY + Math.sin(childAngle) * branchLen;
+
+    this.buffers.x[idx] = x;
+    this.buffers.y[idx] = y;
+    this.buffers.targetX[idx] = x;
+    this.buffers.targetY[idx] = y;
+    this.buffers.angle[idx] = childAngle;
+    this.buffers.radius[idx] = branchLen;
+
+    // Create GourceNode facade (for backward compat with viewer/renderer)
     const node: GourceNode = {
       id: path,
       name,
@@ -789,7 +858,7 @@ export class GourceEngine {
       isVisible: true,
       depth,
       angle: childAngle,
-      radius: branchLength,
+      radius: branchLen,
     };
 
     this.nodes.set(path, node);
@@ -798,6 +867,8 @@ export class GourceEngine {
       parentNode.children.push(path);
     }
 
+    // Trigger incremental tree layout update
+    this.treeLayout.onNodeAdded(idx);
     this.layoutDirty = true;
 
     return node;
@@ -816,6 +887,12 @@ export class GourceEngine {
         // Directories appear immediately
         dirNode.opacity = 0.8;
         dirNode.scale = 1;
+
+        const idx = this.buffers.getIndex(currentPath);
+        if (idx > 0) {
+          this.buffers.opacity[idx] = 0.8;
+          this.buffers.scale[idx] = 1;
+        }
       }
     }
   }
@@ -838,16 +915,32 @@ export class GourceEngine {
     node.modificationCount++;
     node.isVisible = true;
 
+    // Sync to buffers
+    const idx = this.buffers.getIndex(filePath);
+    if (idx > 0) {
+      this.buffers.lastModified[idx] = timestamp;
+      this.buffers.modificationCount[idx] = node.modificationCount;
+      this.buffers.setFlag(idx, NodeFlags.VISIBLE);
+    }
+
     if (isNew || changeType === 'add') {
-      // NEW FILE: explosive pop-in — scale from 0 to 1.5, then settles to 1.0
+      // NEW FILE: explosive pop-in
       node.opacity = 1;
-      node.scale = 0.01; // Start tiny, will animate up in updateLayout
-      // Mark it for the pop-in animation
-      (node as GourceNode & { _popIn?: number })._popIn = 1.5;
+      node.scale = 0.01;
+      if (idx > 0) {
+        this.buffers.opacity[idx] = 1;
+        this.buffers.scale[idx] = 0.01;
+        this.buffers.popInTarget[idx] = 1.5;
+        this.buffers.setFlag(idx, NodeFlags.POP_IN);
+      }
     } else {
       // EXISTING FILE MODIFIED: pulse glow
       node.opacity = 1;
       node.scale = Math.min(node.scale + 0.6, 2.5);
+      if (idx > 0) {
+        this.buffers.opacity[idx] = 1;
+        this.buffers.scale[idx] = node.scale;
+      }
     }
 
     return node;
@@ -857,30 +950,23 @@ export class GourceEngine {
     const node = this.nodes.get(filePath);
     if (!node) return;
 
-    // Animate shrink and fade out (not immediate)
-    // Mark node for deletion animation
-    (node as GourceNode & { _deleting?: boolean })._deleting = true;
-    node.scale = 0.8; // Start shrinking
+    const idx = this.buffers.getIndex(filePath);
 
-    // Create a few farewell particles
+    // Mark for deletion animation
+    node.scale = 0.8;
+    if (idx > 0) {
+      this.buffers.markDeleting(idx);
+      this.buffers.scale[idx] = 0.8;
+    }
+
+    // Subtle fade-out particle on deletion
     if (this.settings.showParticles) {
-      const count = 3;
-      for (let i = 0; i < count; i++) {
-        const angle = Math.random() * Math.PI * 2;
-        const speed = 0.5 + Math.random() * 1.5;
-        const ttl = 20 + Math.floor(Math.random() * 20);
-        this.particles.push({
-          x: node.x,
-          y: node.y,
-          vx: Math.cos(angle) * speed,
-          vy: Math.sin(angle) * speed,
-          color: node.color,
-          size: 1 + Math.random() * 1.5,
-          opacity: 0.6,
-          ttl,
-          maxTtl: ttl,
-        });
-      }
+      const rgb = parseColorToRgb(node.color);
+      this.particlePool.emitBurst(
+        node.x, node.y,
+        rgb.r, rgb.g, rgb.b,
+        2, 0.2, 0.6, 0.5, 1.0, 8, 15,
+      );
     }
 
     // Remove from parent
@@ -892,8 +978,15 @@ export class GourceEngine {
     }
 
     // Schedule removal after fade animation
+    const parentIdx = idx > 0 ? this.buffers.parentIndex[idx] : -1;
     setTimeout(() => {
       this.nodes.delete(filePath);
+      if (idx > 0) {
+        this.buffers.remove(idx);
+        if (parentIdx > 0) {
+          this.treeLayout.onNodeRemoved(parentIdx);
+        }
+      }
     }, 1500);
   }
 
@@ -919,7 +1012,7 @@ export class GourceEngine {
       contributor.lastActiveTime = this.simulationTime;
     }
 
-    // Process each file change — individual file nodes light up
+    // Process each file change
     for (const fileChange of event.affectedFiles) {
       if (fileChange.type === 'delete') {
         this.removeFile(fileChange.path);
@@ -929,14 +1022,30 @@ export class GourceEngine {
       const isNewFile = !this.nodes.has(fileChange.path) || fileChange.type === 'add';
       const node = this.addOrUpdateFile(fileChange.path, event.repoId, event.timestamp, fileChange.type);
 
-      // Create beam from contributor to the individual FILE node (not directory)
+      // Create beam from contributor to the file node
       if (contributor && this.settings.showCommitBeams) {
-        this.createBeam(contributor, node);
+        const rgb = parseColorToRgb(contributor.color);
+        this.beamPool.add(
+          contributor.x, contributor.y,
+          node.x, node.y,
+          rgb.r, rgb.g, rgb.b,
+          50,
+        );
       }
 
-      // Create particles at the file — more explosive for new files
+      // Create a subtle particle pulse at the file
       if (this.settings.showParticles) {
-        this.createParticles(node, contributor?.color || node.color, isNewFile);
+        const rgb = parseColorToRgb(node.color);
+        const count = isNewFile ? 3 : 1;
+
+        this.particlePool.emitBurst(
+          node.x, node.y,
+          rgb.r, rgb.g, rgb.b,
+          count,
+          0.3, 1.0,
+          0.6, 1.5,
+          10, 20,
+        );
       }
     }
 
@@ -959,220 +1068,20 @@ export class GourceEngine {
   }
 
   // ===========================================================================
-  // EFFECTS (BEAMS & PARTICLES)
-  // ===========================================================================
-
-  private createBeam(contributor: GourceContributor, node: GourceNode): void {
-    this.beams.push({
-      fromX: contributor.x,
-      fromY: contributor.y,
-      toX: node.x,
-      toY: node.y,
-      color: contributor.color,
-      progress: 0,
-      opacity: 1.0,
-      ttl: 50,
-    });
-  }
-
-  private createParticles(node: GourceNode, color: string, isNewFile: boolean = false): void {
-    // More particles and faster for new files (explosion effect)
-    const count = isNewFile
-      ? 8 + Math.floor(Math.random() * 8)
-      : 4 + Math.floor(Math.random() * 5);
-    const speedMultiplier = isNewFile ? 1.8 : 1.0;
-    const sizeMultiplier = isNewFile ? 1.4 : 1.0;
-
-    for (let i = 0; i < count; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const speed = (0.8 + Math.random() * 2.5) * speedMultiplier;
-      const ttl = isNewFile
-        ? 35 + Math.floor(Math.random() * 45)
-        : 25 + Math.floor(Math.random() * 35);
-      this.particles.push({
-        x: node.x,
-        y: node.y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        color,
-        size: (1.2 + Math.random() * 2.5) * sizeMultiplier,
-        opacity: 1,
-        ttl,
-        maxTtl: ttl,
-      });
-    }
-  }
-
-  // ===========================================================================
   // PHYSICS / LAYOUT UPDATE
   // ===========================================================================
 
   private updateLayout(dt: number): void {
-    const dtSeconds = dt / 1000;
-    const damping = 0.88;
-    const springStiffness = this.settings.springStiffness;
-    const repulsion = this.settings.repulsionForce;
+    // --- Tree layout physics (spring-to-target + sibling repulsion) ---
+    this.treeLayout.updatePhysics(dt);
 
-    // Process nodes physics
-    const nodeArray = Array.from(this.nodes.values());
-    const visibleNodes = nodeArray.filter((n) => n.isVisible && n.opacity > 0.01);
+    // --- Animations (pop-in, deletion, fading) ---
+    this.treeLayout.updateAnimations(this.simulationTime, this.settings.nodeFadeTime);
 
-    // Use grid-based spatial hashing for O(n) repulsion instead of O(n^2)
-    const gridSize = 80;
-    const grid: Map<string, GourceNode[]> = new Map();
+    // --- Sync buffer positions back to GourceNode Map (for rendering & hit testing) ---
+    this.syncBuffersToNodes();
 
-    for (const node of visibleNodes) {
-      const gx = Math.floor(node.x / gridSize);
-      const gy = Math.floor(node.y / gridSize);
-      const key = `${gx},${gy}`;
-      if (!grid.has(key)) grid.set(key, []);
-      grid.get(key)!.push(node);
-    }
-
-    // Apply repulsion only between nodes in adjacent grid cells
-    for (const node of visibleNodes) {
-      const gx = Math.floor(node.x / gridSize);
-      const gy = Math.floor(node.y / gridSize);
-
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          const key = `${gx + dx},${gy + dy}`;
-          const cellNodes = grid.get(key);
-          if (!cellNodes) continue;
-
-          for (const other of cellNodes) {
-            if (other.id <= node.id) continue; // avoid double processing
-
-            const ddx = other.x - node.x;
-            const ddy = other.y - node.y;
-            const distSq = ddx * ddx + ddy * ddy;
-
-            if (distSq < 0.01 || distSq > gridSize * gridSize * 4) continue;
-
-            const dist = Math.sqrt(distSq);
-            // Stronger repulsion for nearby nodes, especially at same depth
-            const depthBoost = node.depth === other.depth ? 1.5 : 1.0;
-            const force = (repulsion * depthBoost) / distSq;
-            const fx = (ddx / dist) * force;
-            const fy = (ddy / dist) * force;
-
-            node.vx -= fx * dtSeconds;
-            node.vy -= fy * dtSeconds;
-            other.vx += fx * dtSeconds;
-            other.vy += fy * dtSeconds;
-          }
-        }
-      }
-    }
-
-    // Apply spring forces toward parent + angular spreading
-    for (const node of visibleNodes) {
-      if (node.parentId) {
-        const parent = this.nodes.get(node.parentId);
-        if (parent) {
-          const dx = parent.x - node.x;
-          const dy = parent.y - node.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-
-          // Target distance depends on whether it's a directory or file
-          const targetDist = node.isDirectory
-            ? 50 + Math.max(0, 20 - node.depth * 3)
-            : 30 + Math.max(0, 15 - node.depth * 2);
-
-          if (dist > 0.01) {
-            const springForce = (dist - targetDist) * springStiffness * 1.5;
-            node.vx += (dx / dist) * springForce * dtSeconds;
-            node.vy += (dy / dist) * springForce * dtSeconds;
-          }
-
-          // Angular spreading force: push siblings apart
-          if (parent.children.length > 1) {
-            const siblingIdx = parent.children.indexOf(node.id);
-            const angleSlice = (Math.PI * 2) / parent.children.length;
-            const targetAngle = parent.angle + angleSlice * siblingIdx;
-            const currentAngle = Math.atan2(node.y - parent.y, node.x - parent.x);
-            let angleDiff = targetAngle - currentAngle;
-            // Normalize to [-PI, PI]
-            while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-            while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-
-            const angularForce = angleDiff * 0.3 * dtSeconds;
-            const perpX = -Math.sin(currentAngle) * angularForce * dist * 0.02;
-            const perpY = Math.cos(currentAngle) * angularForce * dist * 0.02;
-            node.vx += perpX;
-            node.vy += perpY;
-          }
-        }
-      } else {
-        // Root nodes: very gentle center attraction
-        const dx = -node.x;
-        const dy = -node.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist > 200) {
-          node.vx += (dx / dist) * 0.05 * dtSeconds;
-          node.vy += (dy / dist) * 0.05 * dtSeconds;
-        }
-      }
-
-      // Apply velocity with damping
-      node.x += node.vx;
-      node.y += node.vy;
-      node.vx *= damping;
-      node.vy *= damping;
-
-      // Deletion animation: shrink and fade out
-      const nodeDel = node as GourceNode & { _deleting?: boolean };
-      if (nodeDel._deleting) {
-        node.scale = lerp(node.scale, 0, 0.06);
-        node.opacity = lerp(node.opacity, 0, 0.04);
-        continue; // Skip other scale/opacity logic for deleting nodes
-      }
-
-      // Pop-in animation: scale from tiny -> overshoot -> settle to 1.0
-      const nodeAny = node as GourceNode & { _popIn?: number };
-      if (nodeAny._popIn !== undefined && nodeAny._popIn > 0) {
-        // Rapidly scale up with overshoot
-        const target = nodeAny._popIn;
-        node.scale = lerp(node.scale, target, 0.15);
-        if (node.scale >= target * 0.95) {
-          // Switch to settling phase
-          nodeAny._popIn = 0;
-        }
-      } else if (nodeAny._popIn === 0) {
-        // Settling from overshoot back to 1.0
-        node.scale = lerp(node.scale, 1, 0.08);
-        if (Math.abs(node.scale - 1) < 0.02) {
-          node.scale = 1;
-          delete nodeAny._popIn;
-        }
-      } else if (node.scale > 1) {
-        // Normal pulse decay (from modifications)
-        node.scale = lerp(node.scale, 1, 0.05);
-        if (node.scale < 1.01) node.scale = 1;
-      }
-
-      // Fade out nodes that haven't been modified recently
-      if (!node.isDirectory) {
-        const timeSinceModified = this.simulationTime - node.lastModified;
-        if (node.lastModified > 0 && timeSinceModified > this.settings.nodeFadeTime) {
-          const fadeFactor = (timeSinceModified - this.settings.nodeFadeTime) / (this.settings.nodeFadeTime * 1.5);
-          node.opacity = Math.max(0.15, 1 - fadeFactor * 0.6);
-        }
-      } else {
-        // Directories stay visible as long as they have visible children
-        const hasVisibleChild = node.children.some((childId) => {
-          const child = this.nodes.get(childId);
-          return child && child.opacity > 0.1;
-        });
-        if (hasVisibleChild) {
-          node.opacity = Math.min(1, node.opacity + 0.02);
-        } else if (node.children.length === 0) {
-          node.opacity = Math.max(0, node.opacity - 0.01);
-        }
-      }
-    }
-
-    // Update contributors
+    // --- Update contributors ---
     this.contributors.forEach((contributor) => {
       if (!contributor.isVisible) return;
 
@@ -1190,25 +1099,34 @@ export class GourceEngine {
       }
     });
 
-    // Update beams
-    this.beams = this.beams.filter((beam) => {
-      beam.progress += 0.05;
-      beam.ttl--;
-      beam.opacity = Math.max(0, beam.opacity - 0.018);
-      return beam.ttl > 0 && beam.opacity > 0.01;
-    });
+    // --- Update effects via pools ---
+    this.beamPool.update();
+    this.particlePool.update();
+  }
 
-    // Update particles
-    this.particles = this.particles.filter((particle) => {
-      particle.x += particle.vx;
-      particle.y += particle.vy;
-      particle.vx *= 0.97;
-      particle.vy *= 0.97;
-      particle.ttl--;
-      particle.opacity = (particle.ttl / particle.maxTtl) * 0.8;
-      particle.size *= 0.995;
-      return particle.ttl > 0;
-    });
+  /**
+   * Sync SoA buffer positions/opacity/scale back to the GourceNode Map.
+   * This is the bridge between the new SoA system and the existing rendering
+   * code that reads from GourceNode objects.
+   */
+  private syncBuffersToNodes(): void {
+    const b = this.buffers;
+    for (let i = 1; i <= b.count; i++) {
+      const id = b.getId(i);
+      const node = this.nodes.get(id);
+      if (!node) continue;
+
+      node.x = b.x[i];
+      node.y = b.y[i];
+      node.targetX = b.targetX[i];
+      node.targetY = b.targetY[i];
+      node.vx = b.vx[i];
+      node.vy = b.vy[i];
+      node.opacity = b.opacity[i];
+      node.scale = b.scale[i];
+      node.angle = b.angle[i];
+      node.isVisible = b.hasFlag(i, NodeFlags.VISIBLE);
+    }
   }
 
   // ===========================================================================
@@ -1225,8 +1143,8 @@ export class GourceEngine {
     if (!this.camera.isUserControlled) {
       let sumX = 0;
       let sumY = 0;
-      let count = 0;
       let totalWeight = 0;
+      let count = 0;
 
       this.nodes.forEach((node) => {
         if (node.opacity > 0.3 && !node.isDirectory) {
@@ -1256,12 +1174,14 @@ export class GourceEngine {
     }
   }
 
+  /** Pan the camera by a screen-space delta. */
   public panCamera(dx: number, dy: number): void {
     this.camera.isUserControlled = true;
     this.camera.targetX -= dx / this.camera.zoom;
     this.camera.targetY -= dy / this.camera.zoom;
   }
 
+  /** Zoom the camera, optionally centered on a screen-space point. */
   public zoomCamera(delta: number, centerX?: number, centerY?: number): void {
     const oldZoom = this.camera.targetZoom;
     this.camera.targetZoom = clamp(this.camera.targetZoom * (1 - delta * 0.001), 0.1, 10);
@@ -1276,6 +1196,7 @@ export class GourceEngine {
     this.camera.isUserControlled = true;
   }
 
+  /** Reset camera to center with auto-follow enabled. */
   public resetCamera(): void {
     this.camera.isUserControlled = false;
     this.camera.targetX = 0;
@@ -1284,7 +1205,7 @@ export class GourceEngine {
   }
 
   // ===========================================================================
-  // RENDERING
+  // RENDERING (Canvas 2D — kept as fallback, eventually replaced by WebGL)
   // ===========================================================================
 
   private render(): void {
@@ -1363,7 +1284,6 @@ export class GourceEngine {
     ctx.lineWidth = 0.5;
 
     const gridSpacing = 100;
-    // Offset by camera to create parallax effect
     const offsetX = (this.camera.x * 0.1) % gridSpacing;
     const offsetY = (this.camera.y * 0.1) % gridSpacing;
 
@@ -1391,241 +1311,248 @@ export class GourceEngine {
   }
 
   private renderEdges(ctx: CanvasRenderingContext2D, viewport: Bounds): void {
-    // Draw tree branches as smooth curves with gradient opacity
-    this.nodes.forEach((node) => {
-      if (!node.parentId || node.opacity < 0.05) return;
-      const parent = this.nodes.get(node.parentId);
-      if (!parent || parent.opacity < 0.05) return;
+    const b = this.buffers;
+    for (let i = 1; i <= b.count; i++) {
+      const parentIdx = b.parentIndex[i];
+      if (parentIdx <= 0) continue;
+      if (b.opacity[i] < 0.05 || b.opacity[parentIdx] < 0.05) continue;
+
+      const nx = b.x[i], ny = b.y[i];
+      const px = b.x[parentIdx], py = b.y[parentIdx];
 
       // Cull off-screen edges
-      if (!this.isInViewport(node.x, node.y, viewport, 100) &&
-          !this.isInViewport(parent.x, parent.y, viewport, 100)) return;
+      if (!this.isInViewport(nx, ny, viewport, 100) &&
+          !this.isInViewport(px, py, viewport, 100)) continue;
 
-      const alpha = Math.min(node.opacity, parent.opacity) * 0.35;
-      const thickness = node.isDirectory
+      const alpha = Math.min(b.opacity[i], b.opacity[parentIdx]) * 0.35;
+      const isDir = b.hasFlag(i, NodeFlags.IS_DIR);
+      const thickness = isDir
         ? this.settings.edgeThickness * 1.5
         : this.settings.edgeThickness;
 
       ctx.lineWidth = thickness;
 
-      // Use parent's color for the branch (faded)
-      const branchColor = node.isDirectory ? parent.color : node.color;
-      ctx.strokeStyle = hexToRgba(branchColor, alpha);
+      // Pre-computed color from buffers (avoids per-frame hexToRgba)
+      ctx.strokeStyle = b.getRgba(i, alpha);
 
       ctx.beginPath();
 
       // Organic bezier curve for natural tree branching
-      const dx = node.x - parent.x;
-      const dy = node.y - parent.y;
+      const dx = nx - px;
+      const dy = ny - py;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      const curvature = Math.min(0.3, 15 / dist);
+      const curvature = Math.min(0.3, 15 / Math.max(dist, 1));
 
-      const midX = (parent.x + node.x) / 2;
-      const midY = (parent.y + node.y) / 2;
+      const midX = (px + nx) / 2;
+      const midY = (py + ny) / 2;
       const ctrlX = midX + dy * curvature;
       const ctrlY = midY - dx * curvature;
 
-      ctx.moveTo(parent.x, parent.y);
-      ctx.quadraticCurveTo(ctrlX, ctrlY, node.x, node.y);
+      ctx.moveTo(px, py);
+      ctx.quadraticCurveTo(ctrlX, ctrlY, nx, ny);
       ctx.stroke();
-    });
+    }
   }
 
   private renderNodes(ctx: CanvasRenderingContext2D, viewport: Bounds, showDetails: boolean, showFileLabels: boolean): void {
     let visibleCount = 0;
+    const b = this.buffers;
 
     // Render directories first (underneath files)
-    this.nodes.forEach((node) => {
-      if (!node.isDirectory) return;
-      if (node.opacity < 0.05) return;
-      if (!this.isInViewport(node.x, node.y, viewport)) return;
-      if (visibleCount >= this.settings.maxVisibleNodes) return;
+    for (let i = 1; i <= b.count; i++) {
+      if (!b.hasFlag(i, NodeFlags.IS_DIR)) continue;
+      if (b.opacity[i] < 0.05) continue;
+      if (!this.isInViewport(b.x[i], b.y[i], viewport)) continue;
+      if (visibleCount >= this.settings.maxVisibleNodes) break;
       visibleCount++;
-
-      this.renderDirectoryNode(ctx, node, showDetails);
-    });
+      this.renderDirectoryNodeFromBuffer(ctx, i, showDetails);
+    }
 
     // Then render file nodes on top
-    this.nodes.forEach((node) => {
-      if (node.isDirectory) return;
-      if (node.opacity < 0.05) return;
-      if (!this.isInViewport(node.x, node.y, viewport)) return;
-      if (visibleCount >= this.settings.maxVisibleNodes) return;
+    for (let i = 1; i <= b.count; i++) {
+      if (b.hasFlag(i, NodeFlags.IS_DIR)) continue;
+      if (b.opacity[i] < 0.05) continue;
+      if (!this.isInViewport(b.x[i], b.y[i], viewport)) continue;
+      if (visibleCount >= this.settings.maxVisibleNodes) break;
       visibleCount++;
-
-      this.renderFileNode(ctx, node, showDetails);
-    });
+      this.renderFileNodeFromBuffer(ctx, i, showDetails);
+    }
   }
 
-  private renderDirectoryNode(ctx: CanvasRenderingContext2D, node: GourceNode, showDetails: boolean): void {
+  private renderDirectoryNodeFromBuffer(ctx: CanvasRenderingContext2D, idx: number, showDetails: boolean): void {
+    const b = this.buffers;
+    const x = b.x[idx], y = b.y[idx];
     const size = this.settings.nodeSize * 1.2;
-    const alpha = node.opacity * 0.6;
+    const alpha = b.opacity[idx] * 0.6;
+    const rgba = b.getRgba(idx, alpha);
 
     // Directory: small circle with dim halo
-    if (this.settings.showGlowEffects && node.children.length > 0) {
+    if (this.settings.showGlowEffects && b.childCount[idx] > 0) {
       const haloSize = size * 3;
-      const gradient = ctx.createRadialGradient(node.x, node.y, size * 0.5, node.x, node.y, haloSize);
-      gradient.addColorStop(0, hexToRgba(node.color, alpha * 0.15));
-      gradient.addColorStop(1, hexToRgba(node.color, 0));
+      const gradient = ctx.createRadialGradient(x, y, size * 0.5, x, y, haloSize);
+      gradient.addColorStop(0, b.getRgba(idx, alpha * 0.15));
+      gradient.addColorStop(1, b.getRgba(idx, 0));
       ctx.fillStyle = gradient;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, haloSize, 0, Math.PI * 2);
+      ctx.arc(x, y, haloSize, 0, Math.PI * 2);
       ctx.fill();
     }
 
     // Directory dot
-    ctx.fillStyle = hexToRgba(node.color, alpha);
+    ctx.fillStyle = rgba;
     ctx.beginPath();
-    ctx.arc(node.x, node.y, size * 0.6, 0, Math.PI * 2);
+    ctx.arc(x, y, size * 0.6, 0, Math.PI * 2);
     ctx.fill();
 
     // Thin ring
-    ctx.strokeStyle = hexToRgba(node.color, alpha * 0.5);
+    ctx.strokeStyle = b.getRgba(idx, alpha * 0.5);
     ctx.lineWidth = 0.8;
     ctx.beginPath();
-    ctx.arc(node.x, node.y, size, 0, Math.PI * 2);
+    ctx.arc(x, y, size, 0, Math.PI * 2);
     ctx.stroke();
   }
 
-  private renderFileNode(ctx: CanvasRenderingContext2D, node: GourceNode, showDetails: boolean): void {
-    // File node size scales with modification count (log scale) — more prominent than dirs
+  private renderFileNodeFromBuffer(ctx: CanvasRenderingContext2D, idx: number, showDetails: boolean): void {
+    const b = this.buffers;
+    const x = b.x[idx], y = b.y[idx];
+    const nodeOpacity = b.opacity[idx];
+    const nodeScale = b.scale[idx];
+
     const baseSize = this.settings.nodeSize * 1.1;
-    const modScale = 1 + Math.log2(1 + node.modificationCount) * 0.25;
-    const displayScale = Math.max(node.scale, 0.01); // Ensure we render even during pop-in
+    const modScale = 1 + Math.log2(1 + b.modificationCount[idx]) * 0.25;
+    const displayScale = Math.max(nodeScale, 0.01);
     const size = baseSize * modScale * displayScale;
 
-    const isRecentlyModified = this.simulationTime - node.lastModified < 3000;
+    const isRecentlyModified = this.simulationTime - b.lastModified[idx] < 3000;
     const isPopping = displayScale > 1.1 || displayScale < 0.5;
 
     // Strong glow effect for recently modified / popping files
-    if (this.settings.showGlowEffects && (node.scale > 1.05 || isRecentlyModified)) {
+    if (this.settings.showGlowEffects && (nodeScale > 1.05 || isRecentlyModified)) {
       const glowSize = size * (isPopping ? 5 : 3.5);
       const glowIntensity = isPopping
-        ? Math.min(1, Math.abs(node.scale - 1) * 0.8 + 0.3)
+        ? Math.min(1, Math.abs(nodeScale - 1) * 0.8 + 0.3)
         : (isRecentlyModified ? 0.35 : 0.15);
-      const gradient = ctx.createRadialGradient(node.x, node.y, size * 0.2, node.x, node.y, glowSize);
-      gradient.addColorStop(0, hexToRgba(node.color, glowIntensity * node.opacity));
-      gradient.addColorStop(0.4, hexToRgba(node.color, glowIntensity * node.opacity * 0.4));
-      gradient.addColorStop(1, hexToRgba(node.color, 0));
+      const gradient = ctx.createRadialGradient(x, y, size * 0.2, x, y, glowSize);
+      gradient.addColorStop(0, b.getRgba(idx, glowIntensity * nodeOpacity));
+      gradient.addColorStop(0.4, b.getRgba(idx, glowIntensity * nodeOpacity * 0.4));
+      gradient.addColorStop(1, b.getRgba(idx, 0));
       ctx.fillStyle = gradient;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, glowSize, 0, Math.PI * 2);
+      ctx.arc(x, y, glowSize, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // Subtle ambient glow for all visible files — makes the tree feel alive
-    if (this.settings.showGlowEffects && node.opacity > 0.2) {
+    // Subtle ambient glow
+    if (this.settings.showGlowEffects && nodeOpacity > 0.2) {
       const ambientSize = size * 2.5;
       const ambientIntensity = isRecentlyModified ? 0.18 : 0.08;
-      const gradient = ctx.createRadialGradient(node.x, node.y, size * 0.3, node.x, node.y, ambientSize);
-      gradient.addColorStop(0, hexToRgba(node.color, ambientIntensity * node.opacity));
-      gradient.addColorStop(1, hexToRgba(node.color, 0));
+      const gradient = ctx.createRadialGradient(x, y, size * 0.3, x, y, ambientSize);
+      gradient.addColorStop(0, b.getRgba(idx, ambientIntensity * nodeOpacity));
+      gradient.addColorStop(1, b.getRgba(idx, 0));
       ctx.fillStyle = gradient;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, ambientSize, 0, Math.PI * 2);
+      ctx.arc(x, y, ambientSize, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // File circle — bright, saturated, prominent
-    const fileAlpha = Math.min(1, node.opacity * (isRecentlyModified ? 1.0 : 0.85));
-    ctx.fillStyle = hexToRgba(node.color, fileAlpha);
+    // File circle
+    const fileAlpha = Math.min(1, nodeOpacity * (isRecentlyModified ? 1.0 : 0.85));
+    ctx.fillStyle = b.getRgba(idx, fileAlpha);
     ctx.beginPath();
-    ctx.arc(node.x, node.y, size * 0.55, 0, Math.PI * 2);
+    ctx.arc(x, y, size * 0.55, 0, Math.PI * 2);
     ctx.fill();
 
     // Bright white inner highlight (specular)
-    if (node.opacity > 0.3) {
+    if (nodeOpacity > 0.3) {
       const highlightAlpha = isRecentlyModified ? 0.3 : 0.15;
-      ctx.fillStyle = hexToRgba('#ffffff', node.opacity * highlightAlpha);
+      ctx.fillStyle = `rgba(255,255,255,${nodeOpacity * highlightAlpha})`;
       ctx.beginPath();
-      ctx.arc(node.x - size * 0.1, node.y - size * 0.12, size * 0.22, 0, Math.PI * 2);
+      ctx.arc(x - size * 0.1, y - size * 0.12, size * 0.22, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // Modification pulse rings — expanding outward
-    if (node.scale > 1.05) {
+    // Modification pulse rings
+    if (nodeScale > 1.05) {
       const ringRadius = size * 0.8;
-      const ringAlpha = Math.min(0.8, (node.scale - 1) * node.opacity * 0.7);
+      const ringAlpha = Math.min(0.8, (nodeScale - 1) * nodeOpacity * 0.7);
 
-      // Inner ring
-      ctx.strokeStyle = hexToRgba(node.color, ringAlpha);
+      ctx.strokeStyle = b.getRgba(idx, ringAlpha);
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, ringRadius, 0, Math.PI * 2);
+      ctx.arc(x, y, ringRadius, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Second expanding ring
-      if (node.scale > 1.15) {
-        ctx.strokeStyle = hexToRgba(node.color, ringAlpha * 0.4);
+      if (nodeScale > 1.15) {
+        ctx.strokeStyle = b.getRgba(idx, ringAlpha * 0.4);
         ctx.lineWidth = 1.2;
         ctx.beginPath();
-        ctx.arc(node.x, node.y, ringRadius * 1.6, 0, Math.PI * 2);
+        ctx.arc(x, y, ringRadius * 1.6, 0, Math.PI * 2);
         ctx.stroke();
       }
 
-      // Third ring for big pops
-      if (node.scale > 1.3) {
-        ctx.strokeStyle = hexToRgba(node.color, ringAlpha * 0.15);
+      if (nodeScale > 1.3) {
+        ctx.strokeStyle = b.getRgba(idx, ringAlpha * 0.15);
         ctx.lineWidth = 0.8;
         ctx.beginPath();
-        ctx.arc(node.x, node.y, ringRadius * 2.2, 0, Math.PI * 2);
+        ctx.arc(x, y, ringRadius * 2.2, 0, Math.PI * 2);
         ctx.stroke();
       }
     }
   }
 
   private renderBeams(ctx: CanvasRenderingContext2D): void {
-    for (const beam of this.beams) {
-      const prog = clamp(beam.progress, 0, 1);
+    const bp = this.beamPool;
+    for (let i = 0; i < bp.count; i++) {
+      const prog = clamp(bp.getProgress(i), 0, 1);
+      const opacity = bp.getOpacity(i);
+      if (opacity < 0.01) continue;
 
-      // Bezier curve for more organic beam path
-      const dx = beam.toX - beam.fromX;
-      const dy = beam.toY - beam.fromY;
+      const fromX = bp.getFromX(i), fromY = bp.getFromY(i);
+      const toX = bp.getToX(i), toY = bp.getToY(i);
+      const r = bp.colorR[i], g = bp.colorG[i], b = bp.colorB[i];
+
+      // Bezier curve for organic beam path
+      const dx = toX - fromX;
+      const dy = toY - fromY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      const midX = (beam.fromX + beam.toX) / 2;
-      const midY = (beam.fromY + beam.toY) / 2;
+      const midX = (fromX + toX) / 2;
+      const midY = (fromY + toY) / 2;
       const curvature = Math.min(30, dist * 0.15);
-      const ctrlX = midX + (dy / dist) * curvature;
-      const ctrlY = midY - (dx / dist) * curvature;
+      const ctrlX = midX + (dy / Math.max(dist, 1)) * curvature;
+      const ctrlY = midY - (dx / Math.max(dist, 1)) * curvature;
 
-      // Draw the trail (fading gradient line)
+      // Draw the trail
       ctx.lineWidth = 2;
-      ctx.strokeStyle = hexToRgba(beam.color, beam.opacity * 0.4);
+      ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${opacity * 0.4})`;
       ctx.beginPath();
 
-      // Draw bezier from start to current progress point
       const steps = 20;
       const startStep = Math.max(0, Math.floor((prog - 0.3) * steps));
       const endStep = Math.floor(prog * steps);
 
       for (let s = startStep; s <= endStep; s++) {
         const t = s / steps;
-        // Quadratic bezier: B(t) = (1-t)^2 * P0 + 2(1-t)t * P1 + t^2 * P2
         const omt = 1 - t;
-        const bx = omt * omt * beam.fromX + 2 * omt * t * ctrlX + t * t * beam.toX;
-        const by = omt * omt * beam.fromY + 2 * omt * t * ctrlY + t * t * beam.toY;
-
-        if (s === startStep) {
-          ctx.moveTo(bx, by);
-        } else {
-          ctx.lineTo(bx, by);
-        }
+        const bx = omt * omt * fromX + 2 * omt * t * ctrlX + t * t * toX;
+        const by = omt * omt * fromY + 2 * omt * t * ctrlY + t * t * toY;
+        if (s === startStep) ctx.moveTo(bx, by);
+        else ctx.lineTo(bx, by);
       }
       ctx.stroke();
 
-      // Beam head particle
+      // Beam head
       const headT = prog;
       const omtHead = 1 - headT;
-      const headX = omtHead * omtHead * beam.fromX + 2 * omtHead * headT * ctrlX + headT * headT * beam.toX;
-      const headY = omtHead * omtHead * beam.fromY + 2 * omtHead * headT * ctrlY + headT * headT * beam.toY;
+      const headX = omtHead * omtHead * fromX + 2 * omtHead * headT * ctrlX + headT * headT * toX;
+      const headY = omtHead * omtHead * fromY + 2 * omtHead * headT * ctrlY + headT * headT * toY;
 
       // Head glow
-      if (this.settings.showGlowEffects && beam.opacity > 0.1) {
+      if (this.settings.showGlowEffects && opacity > 0.1) {
         const glowSize = 10;
         const gradient = ctx.createRadialGradient(headX, headY, 0, headX, headY, glowSize);
-        gradient.addColorStop(0, hexToRgba(beam.color, beam.opacity * 0.6));
-        gradient.addColorStop(0.5, hexToRgba(beam.color, beam.opacity * 0.15));
-        gradient.addColorStop(1, hexToRgba(beam.color, 0));
+        gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${opacity * 0.6})`);
+        gradient.addColorStop(0.5, `rgba(${r}, ${g}, ${b}, ${opacity * 0.15})`);
+        gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
         ctx.fillStyle = gradient;
         ctx.beginPath();
         ctx.arc(headX, headY, glowSize, 0, Math.PI * 2);
@@ -1633,7 +1560,7 @@ export class GourceEngine {
       }
 
       // Bright head dot
-      ctx.fillStyle = hexToRgba(beam.color, beam.opacity * 0.8);
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${opacity * 0.8})`;
       ctx.beginPath();
       ctx.arc(headX, headY, 2.5, 0, Math.PI * 2);
       ctx.fill();
@@ -1641,27 +1568,18 @@ export class GourceEngine {
   }
 
   private renderParticles(ctx: CanvasRenderingContext2D): void {
-    for (const particle of this.particles) {
-      if (particle.opacity < 0.02) continue;
+    const pp = this.particlePool;
+    for (let i = 0; i < pp.count; i++) {
+      const opacity = pp.getOpacity(i);
+      if (opacity < 0.02) continue;
 
-      // Soft glow particle
-      if (particle.size > 1.5 && this.settings.showGlowEffects) {
-        const glowSize = particle.size * 3;
-        const gradient = ctx.createRadialGradient(
-          particle.x, particle.y, 0,
-          particle.x, particle.y, glowSize,
-        );
-        gradient.addColorStop(0, hexToRgba(particle.color, particle.opacity * 0.5));
-        gradient.addColorStop(1, hexToRgba(particle.color, 0));
-        ctx.fillStyle = gradient;
-        ctx.beginPath();
-        ctx.arc(particle.x, particle.y, glowSize, 0, Math.PI * 2);
-        ctx.fill();
-      }
+      const px = pp.getX(i), py = pp.getY(i);
+      const size = pp.getSize(i);
+      const r = pp.colorR[i], g = pp.colorG[i], b = pp.colorB[i];
 
-      ctx.fillStyle = hexToRgba(particle.color, particle.opacity * 0.8);
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${opacity * 0.6})`;
       ctx.beginPath();
-      ctx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+      ctx.arc(px, py, size, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -1676,12 +1594,13 @@ export class GourceEngine {
 
       // Glow around contributor
       if (this.settings.showGlowEffects) {
+        const rgb = parseColorToRgb(contributor.color);
         const gradient = ctx.createRadialGradient(
           contributor.x, contributor.y, halfSize,
           contributor.x, contributor.y, halfSize * 3,
         );
-        gradient.addColorStop(0, hexToRgba(contributor.color, 0.15 * contributor.opacity));
-        gradient.addColorStop(1, hexToRgba(contributor.color, 0));
+        gradient.addColorStop(0, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${0.15 * contributor.opacity})`);
+        gradient.addColorStop(1, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0)`);
         ctx.fillStyle = gradient;
         ctx.beginPath();
         ctx.arc(contributor.x, contributor.y, halfSize * 3, 0, Math.PI * 2);
@@ -1704,20 +1623,19 @@ export class GourceEngine {
         );
         ctx.restore();
 
-        // Colored border ring
-        ctx.strokeStyle = hexToRgba(contributor.color, contributor.opacity * 0.9);
+        const rgb = parseColorToRgb(contributor.color);
+        ctx.strokeStyle = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${contributor.opacity * 0.9})`;
         ctx.lineWidth = 2.5;
         ctx.beginPath();
         ctx.arc(contributor.x, contributor.y, halfSize + 1.5, 0, Math.PI * 2);
         ctx.stroke();
       } else {
-        // Fallback colored circle with initials
-        ctx.fillStyle = hexToRgba(contributor.color, contributor.opacity * 0.9);
+        const rgb = parseColorToRgb(contributor.color);
+        ctx.fillStyle = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${contributor.opacity * 0.9})`;
         ctx.beginPath();
         ctx.arc(contributor.x, contributor.y, halfSize, 0, Math.PI * 2);
         ctx.fill();
 
-        // Initials
         const initials = contributor.name.charAt(0).toUpperCase();
         ctx.fillStyle = `rgba(255,255,255,${contributor.opacity * 0.9})`;
         ctx.font = 'bold 11px -apple-system, system-ui, sans-serif';
@@ -1733,7 +1651,6 @@ export class GourceEngine {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
 
-        // Background pill for name
         const nameWidth = ctx.measureText(contributor.name).width;
         const pillX = contributor.x - nameWidth / 2 - 4;
         const pillY = contributor.y + halfSize + 4;
@@ -1749,13 +1666,11 @@ export class GourceEngine {
   }
 
   private renderLabels(ctx: CanvasRenderingContext2D, viewport: Bounds, showFileLabels: boolean): void {
-    // Render directory labels
     this.nodes.forEach((node) => {
       if (node.opacity < 0.2) return;
       if (!this.isInViewport(node.x, node.y, viewport)) return;
 
       if (node.isDirectory) {
-        // Show directory labels based on depth and zoom
         if (node.depth > 3 && this.camera.zoom < 2) return;
         if (node.depth > 5) return;
         if (node.children.length === 0) return;
@@ -1765,7 +1680,6 @@ export class GourceEngine {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'bottom';
 
-        // Text background for readability
         const labelWidth = ctx.measureText(node.name).width;
         const labelX = node.x - labelWidth / 2 - 3;
         const labelY = node.y - this.settings.nodeSize * 1.5 - 2;
@@ -1778,7 +1692,6 @@ export class GourceEngine {
         ctx.fillStyle = `rgba(210, 215, 230, ${node.opacity * 0.75})`;
         ctx.fillText(node.name, node.x, node.y - this.settings.nodeSize * 1.5);
       } else if (showFileLabels) {
-        // Show file labels only when zoomed in enough
         if (node.opacity < 0.5) return;
 
         const fontSize = 8;
@@ -1790,7 +1703,12 @@ export class GourceEngine {
         const labelX = node.x + fileSize / 2 + 4;
         const displayName = node.name.length > 20 ? node.name.substring(0, 18) + '..' : node.name;
 
-        ctx.fillStyle = hexToRgba(node.color, node.opacity * 0.6);
+        const idx = this.buffers.getIndex(node.id);
+        if (idx > 0) {
+          ctx.fillStyle = this.buffers.getRgba(idx, node.opacity * 0.6);
+        } else {
+          ctx.fillStyle = hexToRgba(node.color, node.opacity * 0.6);
+        }
         ctx.fillText(displayName, labelX, node.y);
       }
     });
@@ -1799,7 +1717,6 @@ export class GourceEngine {
   private renderDateOverlay(ctx: CanvasRenderingContext2D, w: number, h: number): void {
     const dateStr = dateToString(this.simulationTime);
 
-    // Date display with background
     const fontSize = Math.min(28, w * 0.035);
     ctx.font = `bold ${fontSize}px "SF Mono", "Fira Code", "Cascadia Code", monospace`;
     ctx.textAlign = 'right';
@@ -1811,13 +1728,11 @@ export class GourceEngine {
     const dateBoxX = w - 20 - dateWidth - datePadX;
     const dateBoxY = 16;
 
-    // Background pill
     ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
     ctx.beginPath();
     ctx.roundRect(dateBoxX, dateBoxY, dateWidth + datePadX * 2, fontSize + datePadY * 2, 8);
     ctx.fill();
 
-    // Border
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -1829,8 +1744,14 @@ export class GourceEngine {
 
     // Stats below date
     const nodeCount = this.nodes.size;
-    const fileCount = Array.from(this.nodes.values()).filter((n) => !n.isDirectory).length;
-    const contributorCount = Array.from(this.contributors.values()).filter((c) => c.isVisible).length;
+    let fileCount = 0;
+    const b = this.buffers;
+    for (let i = 1; i <= b.count; i++) {
+      if (!b.hasFlag(i, NodeFlags.IS_DIR)) fileCount++;
+    }
+    let contributorCount = 0;
+    this.contributors.forEach((c) => { if (c.isVisible) contributorCount++; });
+
     ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
     ctx.font = '11px -apple-system, system-ui, sans-serif';
     ctx.fillText(
@@ -1841,8 +1762,6 @@ export class GourceEngine {
   }
 
   private renderLegendOverlay(ctx: CanvasRenderingContext2D, w: number, h: number): void {
-    // Small language color legend in the bottom-right
-    // Collect unique extensions currently visible
     const extensionColors = new Map<string, { color: string; count: number; language: string }>();
 
     this.nodes.forEach((node) => {
@@ -1860,12 +1779,10 @@ export class GourceEngine {
 
     if (extensionColors.size === 0) return;
 
-    // Sort by count descending, take top 8
     const sorted = Array.from(extensionColors.values())
       .sort((a, b) => b.count - a.count)
       .slice(0, 8);
 
-    // Deduplicate by language name
     const seen = new Set<string>();
     const deduped: typeof sorted = [];
     for (const entry of sorted) {
@@ -1879,7 +1796,6 @@ export class GourceEngine {
     const legendY = h - 20 - deduped.length * 18;
     const dotSize = 5;
 
-    // Background
     const bgWidth = 120;
     const bgHeight = deduped.length * 18 + 12;
     ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
@@ -1895,17 +1811,14 @@ export class GourceEngine {
       const entry = deduped[i];
       const y = legendY + i * 18 + 6;
 
-      // Color dot
       ctx.fillStyle = entry.color;
       ctx.beginPath();
       ctx.arc(legendX + dotSize, y, dotSize, 0, Math.PI * 2);
       ctx.fill();
 
-      // Language name
       ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
       ctx.fillText(entry.language, legendX + dotSize * 2 + 6, y);
 
-      // Count
       ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
       ctx.fillText(`${entry.count}`, legendX + bgWidth - 26, y);
     }
@@ -1984,11 +1897,15 @@ export class GourceEngine {
       // Stats callback (every 500ms)
       if (timestamp - this.lastStatsUpdate > 500) {
         this.lastStatsUpdate = timestamp;
+        let edgeCount = 0;
+        for (let i = 1; i <= this.buffers.count; i++) {
+          if (this.buffers.parentIndex[i] > 0) edgeCount++;
+        }
         this.callbacks.onStatsUpdate?.({
           fps: this.loopState.fps,
-          nodeCount: this.nodes.size,
-          edgeCount: Array.from(this.nodes.values()).filter((n) => n.parentId).length,
-          beamCount: this.beams.length,
+          nodeCount: this.buffers.count,
+          edgeCount,
+          beamCount: this.beamPool.count,
         });
       }
     } catch (err) {
@@ -2012,6 +1929,7 @@ export class GourceEngine {
   // PUBLIC CONTROLS
   // ===========================================================================
 
+  /** Start the game loop and begin playback. */
   public start(): void {
     if (this.loopState.isRunning) return;
     this.loopState.isRunning = true;
@@ -2021,6 +1939,7 @@ export class GourceEngine {
     this.animationFrameId = requestAnimationFrame(this.gameLoop);
   }
 
+  /** Stop the game loop entirely. */
   public stop(): void {
     this.loopState.isRunning = false;
     this.state.playback = PlaybackState.STOPPED;
@@ -2031,6 +1950,7 @@ export class GourceEngine {
     }
   }
 
+  /** Resume playback (starts the loop if not already running). */
   public play(): void {
     if (this.state.playback === PlaybackState.PLAYING) return;
 
@@ -2042,15 +1962,18 @@ export class GourceEngine {
     }
   }
 
+  /** Pause playback (keeps the render loop alive for camera smoothing). */
   public pause(): void {
     this.state.playback = PlaybackState.PAUSED;
     this.callbacks.onPlaybackChange?.(PlaybackState.PAUSED);
   }
 
-  public setSpeed(speed: number): void {
-    this.state.speed = speed as PlaybackSpeed;
+  /** Set the playback speed multiplier. */
+  public setSpeed(speed: PlaybackSpeed): void {
+    this.state.speed = speed;
   }
 
+  /** Seek to a normalized progress position (0-1). */
   public seek(progress: number): void {
     const clampedProgress = clamp(progress, 0, 1);
     const targetTime = this.startTime + clampedProgress * (this.endTime - this.startTime);
@@ -2059,7 +1982,6 @@ export class GourceEngine {
     this.state.playback = PlaybackState.SEEKING;
 
     if (targetTime < this.simulationTime) {
-      // Seeking backward: reset and replay
       this.resetScene();
       this.simulationTime = this.startTime;
       this.currentEventIndex = 0;
@@ -2072,18 +1994,18 @@ export class GourceEngine {
     this.state.progress = clampedProgress;
     this.state.currentDate = dateToString(this.simulationTime);
 
-    // Restore previous playback state
+    // Recompute full tree layout after seek
+    this.treeLayout.recomputeAll();
+
     this.state.playback = previousPlayback;
     this.callbacks.onDateChange?.(this.state.currentDate);
 
-    // Force render
     if (!this.loopState.isRunning) {
       this.render();
     }
   }
 
   private resetScene(): void {
-    // Keep root nodes, remove everything else
     const rootNodeIds = this.repositories.map((r) => r.fullName);
     const toKeep = new Set(rootNodeIds);
 
@@ -2101,6 +2023,28 @@ export class GourceEngine {
       }
     });
 
+    // Reset SoA buffers (but keep root nodes)
+    this.buffers.clear();
+    this.treeLayout = new TreeLayout(this.buffers);
+
+    // Re-create root nodes in buffers
+    for (let i = 0; i < this.repositories.length; i++) {
+      const repo = this.repositories[i];
+      const idx = this.buffers.allocate(repo.fullName);
+      const rootNode = this.nodes.get(repo.fullName);
+      if (rootNode && idx > 0) {
+        this.buffers.x[idx] = rootNode.x;
+        this.buffers.y[idx] = rootNode.y;
+        this.buffers.targetX[idx] = rootNode.targetX;
+        this.buffers.targetY[idx] = rootNode.targetY;
+        this.buffers.opacity[idx] = 1;
+        this.buffers.scale[idx] = 1;
+        this.buffers.setFlag(idx, NodeFlags.IS_DIR | NodeFlags.VISIBLE);
+        this.buffers.setColor(idx, rootNode.color);
+        this.treeLayout.addRoot(idx);
+      }
+    }
+
     // Reset contributor visibility
     this.contributors.forEach((c) => {
       c.isVisible = false;
@@ -2108,8 +2052,8 @@ export class GourceEngine {
     });
 
     // Clear effects
-    this.beams = [];
-    this.particles = [];
+    this.beamPool.clear();
+    this.particlePool.clear();
 
     // Reset processed flags
     this.commitEvents.forEach((e) => {
@@ -2117,50 +2061,59 @@ export class GourceEngine {
     });
   }
 
+  /** Get the current simulation timestamp in milliseconds. */
   public getCurrentTime(): number {
     return this.simulationTime;
   }
 
+  /** Get a snapshot of the current engine state. */
   public getState(): GourceState {
     return { ...this.state, camera: { ...this.camera }, settings: { ...this.settings } };
   }
 
+  /** Filter visualization to a single repository, or null for combined view. */
   public setActiveRepo(repoId: string | null): void {
     this.state.activeRepoId = repoId;
     this.state.isCombinedView = repoId === null;
 
-    // Reset and replay with filter
     this.resetScene();
     this.simulationTime = this.startTime;
     this.currentEventIndex = 0;
     this.seek(this.state.progress);
   }
 
+  /** Merge partial settings into the current configuration. */
   public setSettings(settings: Partial<GourceSettings>): void {
     this.settings = { ...this.settings, ...settings };
     this.state.settings = { ...this.settings };
   }
 
+  /** Get a copy of the current settings. */
   public getSettings(): GourceSettings {
     return { ...this.settings };
   }
 
+  /** Register event callbacks for frame updates, date changes, etc. */
   public setCallbacks(callbacks: GourceEngineCallbacks): void {
     this.callbacks = callbacks;
   }
 
+  /** Get the node Map (used by viewer for hit testing and tooltips). */
   public getNodes(): Map<string, GourceNode> {
     return this.nodes;
   }
 
+  /** Get the contributor Map. */
   public getContributors(): Map<string, GourceContributor> {
     return this.contributors;
   }
 
+  /** Get the processed commit events array. */
   public getCommitEvents(): GourceCommitEvent[] {
     return this.commitEvents;
   }
 
+  /** Compute a histogram of commit counts over evenly-spaced time buckets. */
   public getCommitDensity(bucketCount: number = 100): number[] {
     if (this.commitEvents.length === 0) return new Array(bucketCount).fill(0);
 
@@ -2181,22 +2134,27 @@ export class GourceEngine {
     return density;
   }
 
+  /** Get the earliest commit date as an ISO date string. */
   public getStartDate(): string {
     return dateToString(this.startTime);
   }
 
+  /** Get the latest commit date as an ISO date string. */
   public getEndDate(): string {
     return dateToString(this.endTime);
   }
 
+  /** Get the total time span in milliseconds. */
   public getTotalDuration(): number {
     return this.endTime - this.startTime;
   }
 
+  /** Get the current normalized playback progress (0-1). */
   public getProgress(): number {
     return this.state.progress;
   }
 
+  /** Highlight a single contributor (filters future commits) or clear with null. */
   public highlightContributor(contributorId: string | null): void {
     if (contributorId === null) {
       this.settings.contributorFilter = null;
@@ -2205,16 +2163,33 @@ export class GourceEngine {
     }
   }
 
+  /** Get the color assigned to each repository. */
   public getRepoColors(): Map<string, string> {
     return new Map(this.repoColorMap);
   }
 
+  /** Get the SoA buffers (for WebGL renderer or worker). */
+  public getBuffers(): LayoutBuffers {
+    return this.buffers;
+  }
+
+  /** Get the beam pool (for WebGL renderer). */
+  public getBeamPool(): BeamPool {
+    return this.beamPool;
+  }
+
+  /** Get the particle pool (for WebGL renderer). */
+  public getParticlePool(): ParticlePool {
+    return this.particlePool;
+  }
+
+  /** Tear down the engine and release all resources. */
   public destroy(): void {
     this.stop();
     this.nodes.clear();
     this.contributors.clear();
-    this.beams = [];
-    this.particles = [];
+    this.beamPool.clear();
+    this.particlePool.clear();
     this.commitEvents = [];
     this.avatarImages.clear();
     this.canvas = null;
@@ -2226,6 +2201,7 @@ export class GourceEngine {
 // FACTORY FUNCTION
 // =============================================================================
 
+/** Create a new GourceEngine instance from commit and repository data. */
 export function createGourceEngine(data: GourceEngineData): GourceEngine {
   return new GourceEngine(data);
 }
@@ -2234,6 +2210,7 @@ export function createGourceEngine(data: GourceEngineData): GourceEngine {
 // HIT DETECTION
 // =============================================================================
 
+/** Find the closest visible node within hit radius of a world-space point. */
 export function hitTestNode(
   worldX: number,
   worldY: number,
@@ -2259,6 +2236,7 @@ export function hitTestNode(
   return closest;
 }
 
+/** Find the closest visible contributor within hit radius of a world-space point. */
 export function hitTestContributor(
   worldX: number,
   worldY: number,
@@ -2287,6 +2265,7 @@ export function hitTestContributor(
 // SCREEN-TO-WORLD CONVERSION
 // =============================================================================
 
+/** Convert screen-space coordinates to world-space given the current camera. */
 export function screenToWorld(
   screenX: number,
   screenY: number,
@@ -2300,6 +2279,7 @@ export function screenToWorld(
   };
 }
 
+/** Convert world-space coordinates to screen-space given the current camera. */
 export function worldToScreen(
   worldX: number,
   worldY: number,
