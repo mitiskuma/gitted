@@ -30,15 +30,11 @@ import type {
   GourceCommitEvent,
 } from '@/lib/types';
 import {
-  PlaybackState,
   PlaybackSpeed,
   DEFAULT_GOURCE_SETTINGS,
 } from '@/lib/types';
 
-// =============================================================================
-// MAIN GOURCE PAGE
-// =============================================================================
-
+/** Main Gource visualization page orchestrating the viewer, playback, and settings. */
 export default function GourcePage() {
   const router = useRouter();
   const {
@@ -489,7 +485,7 @@ export default function GourcePage() {
             size="icon"
             onClick={handleToggleRecording}
             className={`h-8 w-8 hover:bg-white/5 hover:text-white ${isRecording ? 'text-red-400 animate-pulse' : 'text-white/50'}`}
-            title={isRecording ? 'Stop Recording & Download' : 'Record Video'}
+            aria-label={isRecording ? 'Stop recording and download' : 'Record video'}
           >
             {isRecording ? (
               <div className="h-3 w-3 rounded-sm bg-red-400" />
@@ -503,7 +499,7 @@ export default function GourcePage() {
             size="icon"
             onClick={() => setShowLegend(!showLegend)}
             className={`h-8 w-8 text-white/50 hover:bg-white/5 hover:text-white ${showLegend ? 'bg-white/10 text-white' : ''}`}
-            title="Toggle contributor legend"
+            aria-label={showLegend ? 'Hide contributor legend' : 'Show contributor legend'}
           >
             <Users className="h-4 w-4" />
           </Button>
@@ -519,7 +515,7 @@ export default function GourcePage() {
             size="icon"
             onClick={toggleFullscreen}
             className="h-8 w-8 text-white/50 hover:bg-white/5 hover:text-white"
-            title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+            aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
           >
             {isFullscreen ? (
               <Minimize className="h-4 w-4" />
@@ -542,12 +538,6 @@ export default function GourcePage() {
               settings={settings}
               combinedView={activeRepoId === null}
               activeRepoId={activeRepoId}
-              onPlaybackChange={(state) => {
-                // Sync from the viewer's internal engine callbacks
-              }}
-              onDateChange={(date) => {
-                // Date is synced via the playback hook
-              }}
               onEngineReady={handleEngineReady}
               className="h-full w-full"
             />
@@ -591,6 +581,7 @@ export default function GourcePage() {
           <TimelineScrubber
             progress={playback.progress}
             onSeek={playback.seek}
+            onSeekStart={() => playback.pause()}
             startDate={timelineStartDate}
             endDate={timelineEndDate}
             commitDensity={commitDensity}

@@ -39,12 +39,13 @@ export const metadata: Metadata = {
     'commits',
     'repository',
   ],
-  authors: [{ name: 'gitted' }],
+  authors: [{ name: 'gitted', url: 'https://github.com/mitiskuma/gitted' }],
   openGraph: {
     title: 'gitted — Your Git Story, Visualized',
     description:
       'Transform your GitHub repositories into stunning visual stories. Discover patterns, celebrate milestones, and share your developer journey.',
     type: 'website',
+    url: 'https://github.com/mitiskuma/gitted',
     siteName: 'gitted',
   },
   twitter: {

@@ -25,6 +25,7 @@ import {
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import {
   GitBranch,
+  Github,
   Menu,
   Home,
   Link2,
@@ -284,6 +285,17 @@ export function Navbar() {
 
         {/* ── Right side: ThemeToggle, User, CTA, Mobile ─────────────── */}
         <div className="flex items-center gap-3">
+          {/* GitHub repo link */}
+          <a
+            href="https://github.com/mitiskuma/gitted"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hidden items-center justify-center rounded-lg p-2 text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground sm:flex"
+            aria-label="View source on GitHub"
+          >
+            <Github className="h-[18px] w-[18px]" />
+          </a>
+
           {/* User avatar dropdown OR Play Now CTA */}
           {isGitHubConnected && githubUser ? (
             <UserAvatarDropdown user={githubUser} />

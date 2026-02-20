@@ -19,6 +19,7 @@ interface GourceViewerInternalProps extends GourceViewerProps {
   onContributorHover?: (contributor: GourceContributor | null) => void;
 }
 
+/** Canvas-based Gource visualization viewer with pan, zoom, and touch support. */
 export function GourceViewer({
   events,
   repositories,
@@ -512,6 +513,8 @@ export function GourceViewer({
         ref={canvasRef}
         className="absolute inset-0 w-full h-full"
         style={{ cursor: getCursorStyle() }}
+        aria-label="Gource commit history visualization"
+        role="img"
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}

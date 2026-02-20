@@ -1,7 +1,16 @@
 {
   "name": "gitted",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mitiskuma/gitted.git"
+  },
+  "homepage": "https://github.com/mitiskuma/gitted",
+  "bugs": {
+    "url": "https://github.com/mitiskuma/gitted/issues"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",

@@ -118,16 +118,24 @@ export function Footer() {
               ))}
             </nav>
 
-            {/* GitHub link */}
-            <div className="mt-4 flex items-center gap-2 text-xs text-muted-foreground/60">
-              <Github className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>
+            {/* GitHub links */}
+            <div className="mt-4 flex flex-col gap-1.5">
+              <a
+                href="https://github.com/mitiskuma/gitted"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 text-xs text-muted-foreground/60 transition-colors hover:text-muted-foreground"
+              >
+                <Github className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Open source on GitHub</span>
+              </a>
+              <span className="pl-5.5 text-xs text-muted-foreground/40">
                 Powered by the{' '}
                 <a
                   href="https://docs.github.com/en/rest"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="underline underline-offset-2 transition-colors hover:text-muted-foreground"
+                  className="underline underline-offset-2 transition-colors hover:text-muted-foreground/60"
                 >
                   GitHub API
                 </a>
@@ -160,14 +168,25 @@ export function Footer() {
           <p className="text-xs text-muted-foreground/60">
             &copy; {currentYear} gitted
           </p>
-          <p className="flex items-center gap-1.5 text-xs text-muted-foreground/60">
-            Built with
-            <Heart
-              className="h-3 w-3 fill-red-500 text-red-500"
-              aria-label="love"
-            />
-            for developers
-          </p>
+          <div className="flex items-center gap-4">
+            <p className="flex items-center gap-1.5 text-xs text-muted-foreground/60">
+              Built with
+              <Heart
+                className="h-3 w-3 fill-red-500 text-red-500"
+                aria-label="love"
+              />
+              for developers
+            </p>
+            <a
+              href="https://github.com/mitiskuma/gitted"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-muted-foreground/40 transition-colors hover:text-muted-foreground/70"
+              aria-label="GitHub repository"
+            >
+              <Github className="h-4 w-4" />
+            </a>
+          </div>
         </div>
       </div>
     </footer>
